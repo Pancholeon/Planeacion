@@ -125,6 +125,35 @@ def distancia_km(lat1, lon1, lat2, lon2):
     x = (lon2 - lon1) * np.cos((lat1 + lat2) / 2)
     y = lat2 - lat1
     return 6371 * np.sqrt(x * x + y * y)
+    
+def parse_polygon_text(texto: str) -> list[tuple[float, float]]:
+    puntos = []
+    if not texto:
+        return puntos
+    for par in texto.split(";"):
+        if not par.strip():
+            continue
+        lat_str, lon_str = [x.strip() for x in par.split(",")]
+        puntos.append((float(lat_str), float(lon_str)))
+    return puntos
+
+
+def punto_en_poligono(lat: float, lon: float, poligono: list[tuple[float, float]]) -> bool:
+    if len(poligono) < 3 or pd.isna(lat) or pd.isna(lon):
+        return False
+    dentro = False
+    x = lon
+    y = lat
+    n = len(poligono)
+    for i in range(n):
+        y1, x1 = poligono[i]
+        y2, x2 = poligono[(i + 1) % n]
+        cruza = ((y1 > y) != (y2 > y))
+        if cruza:
+            xinters = (x2 - x1) * (y - y1) / ((y2 - y1) + 1e-12) + x1
+            if x < xinters:
+                dentro = not dentro
+    return dentro
 
 
 def clean_geo(df: pd.DataFrame, lat_col: str, lon_col: str) -> pd.DataFrame:
@@ -173,6 +202,7 @@ def construir_plantilla(num_entrevistadores: int, num_supervisores: int) -> pd.D
 def generar_alertas(
     df: pd.DataFrame,
     radio_max_radicacion: float = 25.0,
+    permitir_reasignable_sin_partir: bool = True,
 ) -> pd.DataFrame:
     df = df.copy()
 
@@ -201,7 +231,12 @@ def generar_alertas(
         df["distancia_radicacion_km"].notna()
         & (df["distancia_radicacion_km"] > radio_max_radicacion)
     )
-    df.loc[mask_rad & (df["alerta"] == "OK"), "alerta"] = "LEJOS DE RADICACION"
+    if permitir_reasignable_sin_partir and "radicacion_viable" in df.columns:
+        mask_reasignable = mask_rad & (df["alerta"] == "OK") & df["radicacion_viable"]
+        df.loc[mask_reasignable, "alerta"] = "REASIGNABLE SIN PARTIR"
+        df.loc[mask_rad & (df["alerta"] == "OK"), "alerta"] = "LEJOS DE RADICACION"
+    else:
+        df.loc[mask_rad & (df["alerta"] == "OK"), "alerta"] = "LEJOS DE RADICACION"
     return df
 
 
@@ -215,7 +250,7 @@ def asignacion_balanceada_geografica(
     """
     Asignación compacta con capacidad:
     - inicia con centroides geográficos
-    - incorpora radicación del entrevistador
+    - incorpora radicación del entrevistador y dispersion
     - asigna respetando cupos balanceados
     - itera para compactar
     """
@@ -230,9 +265,23 @@ def asignacion_balanceada_geografica(
     coords = df_validos[[lat_col, lon_col]].to_numpy()
 
     modelo = KMeans(n_clusters=k, random_state=42, n_init=15)
-    _ = modelo.fit_predict(coords)
+    labels_init = modelo.fit_predict(coords)
     centroides = modelo.cluster_centers_.copy()
-
+    
+   if partir_por_columna and partir_por_columna in df_validos.columns:
+        grupos = df_validos[partir_por_columna].fillna("SIN_DATO").astype(str)
+        codigos = pd.factorize(grupos)[0]
+        grupo_objetivo = {}
+        for j, ent in enumerate(entrevistadores):
+            maskj = labels_init == j
+            if maskj.any():
+                vals, cts = np.unique(codigos[maskj], return_counts=True)
+                grupo_objetivo[ent] = vals[np.argmax(cts)]
+            else:
+                grupo_objetivo[ent] = codigos[0]
+    else:
+        codigos = np.zeros(n, dtype=int)
+        grupo_objetivo = {ent: 0 for ent in entrevistadores}
     base_cupo = n // k
     residuo = n % k
     cupos = {
@@ -257,7 +306,24 @@ def asignacion_balanceada_geografica(
                 rad_coords[j, 1],
             )
 
-        costo_total = costo_cluster + (peso_radicacion * costo_radicacion / 100.0)
+        for j, ent in enumerate(entrevistadores):
+            mask = np.array(asignados) == ent if asignados is not None else np.zeros(n, dtype=bool)
+            if mask.any():
+                centro_ent = coords[mask].mean(axis=0)
+            else:
+                centro_ent = centroides[j]
+            d_geo = np.sqrt(((coords - centro_ent) ** 2).sum(axis=1))
+            d_geo = d_geo - d_geo.min()
+            denom = d_geo.max() if d_geo.max() > 0 else 1.0
+            costo_dispersion[:, j] = d_geo / denom
+
+        costo_particion = np.zeros((n, k))
+        if partir_por_columna and partir_por_columna in df_validos.columns:
+            for j, ent in enumerate(entrevistadores):
+                costo_particion[:, j] = (codigos != grupo_objetivo[ent]).astype(float) * 5.0
+
+        costo_total = costo_cluster + (peso_radicacion * costo_radicacion / 100.0) + (peso_dispersion * costo_dispersion) + costo_particion
+        
         preferencias = np.argsort(costo_total, axis=1)
 
         nuevos_asignados = [None] * n
@@ -288,6 +354,85 @@ def asignacion_balanceada_geografica(
                 centroides[j] = coords[mask].mean(axis=0)
 
     df_validos["asignado_a"] = asignados
+
+def recalcular_metricas_asignacion(
+    df: pd.DataFrame,
+    plantilla: pd.DataFrame,
+    lat_col: str,
+    lon_col: str,
+) -> pd.DataFrame:
+    out = df.copy()
+    mapa_sup = dict(zip(plantilla["ENTREVISTADOR"], plantilla["SUPERV"]))
+    mapa_roe = dict(zip(plantilla["ENTREVISTADOR"], plantilla["ROE"]))
+    mapa_mun = dict(zip(plantilla["ENTREVISTADOR"], plantilla["MUNICIPIO_RADICACION"]))
+    mapa_lat_rad = dict(zip(plantilla["ENTREVISTADOR"], plantilla["LAT_RADICACION"]))
+    mapa_lon_rad = dict(zip(plantilla["ENTREVISTADOR"], plantilla["LON_RADICACION"]))
+
+    out["SUPERV"] = out["asignado_a"].map(mapa_sup)
+    out["ROE"] = out["asignado_a"].map(mapa_roe)
+    out["MUNICIPIO_RADICACION"] = out["asignado_a"].map(mapa_mun)
+    out["LAT_RADICACION"] = out["asignado_a"].map(mapa_lat_rad)
+    out["LON_RADICACION"] = out["asignado_a"].map(mapa_lon_rad)
+
+    centroides = (
+        out[out["asignado_a"].notna()]
+        .groupby("asignado_a")[[lat_col, lon_col]]
+        .mean()
+        .to_dict("index")
+    )
+
+    out["distancia_centroide"] = out.apply(
+        lambda row: np.sqrt(
+            (row[lat_col] - centroides[row["asignado_a"]][lat_col]) ** 2
+            + (row[lon_col] - centroides[row["asignado_a"]][lon_col]) ** 2
+        )
+        if pd.notna(row["asignado_a"]) and row["asignado_a"] in centroides
+        else np.nan,
+        axis=1,
+    )
+
+    out["distancia_radicacion_km"] = out.apply(
+        lambda row: distancia_km(
+            row[lat_col],
+            row[lon_col],
+            row["LAT_RADICACION"],
+            row["LON_RADICACION"],
+        )
+        if pd.notna(row["asignado_a"])
+        else np.nan,
+        axis=1,
+    )
+
+    out["radicacion_viable"] = False
+    asignables = out[out["coord_valida"]].copy()
+    if len(asignables) > 0:
+        rad_coords = plantilla[["LAT_RADICACION", "LON_RADICACION"]].to_numpy()
+        puntos = asignables[[lat_col, lon_col]].to_numpy()
+        dist_matrix = np.zeros((len(puntos), len(rad_coords)))
+        for j in range(len(rad_coords)):
+            dist_matrix[:, j] = distancia_km(
+                puntos[:, 0],
+                puntos[:, 1],
+                rad_coords[j, 0],
+                rad_coords[j, 1],
+            )
+        out.loc[asignables.index, "radicacion_viable"] = np.isfinite(dist_matrix.min(axis=1))
+
+    return out
+
+
+def reasignar_por_poligono(
+    df: pd.DataFrame,
+    poligono: list[tuple[float, float]],
+    nuevo_entrevistador: str,
+    lat_col: str,
+    lon_col: str,
+) -> tuple[pd.DataFrame, int]:
+    out = df.copy()
+    mask = out.apply(lambda r: punto_en_poligono(r[lat_col], r[lon_col], poligono), axis=1)
+    out.loc[mask, "asignado_a"] = nuevo_entrevistador
+    out.loc[mask, "estatus_asignacion"] = "Asignado (manual polígono)"
+    return out, int(mask.sum())
 
     mapa_sup = dict(zip(plantilla["ENTREVISTADOR"], plantilla["SUPERV"]))
     mapa_roe = dict(zip(plantilla["ENTREVISTADOR"], plantilla["ROE"]))
@@ -386,10 +531,13 @@ def construir_mapa(
     id_col: Optional[str],
 ):
     category_orders = {}
-    if color_col == "asignado_a":
-        category_orders[color_col] = ordenar_natural(
-            [x for x in df[color_col].dropna().unique().tolist()]
-        )
+       if color_col in df.columns:
+        entrevistadores = [
+            x for x in df[color_col].dropna().unique().tolist()
+            if isinstance(x, str) and re.match(r"^E\d+$", x)
+        ]
+        otros = [x for x in df[color_col].dropna().unique().tolist() if x not in entrevistadores]
+        category_orders[color_col] = ordenar_natural(entrevistadores) + sorted(otros)
 
     fig = px.scatter_map(
         df,
@@ -407,7 +555,7 @@ def construir_mapa(
             "alerta": True if "alerta" in df.columns else False,
         },
         zoom=6,
-        height=700,
+        height=950,
         title="Puntos asignados en Sinaloa",
     )
 
@@ -511,12 +659,29 @@ peso_radicacion = st.sidebar.number_input(
     step=0.5,
     help="Mayor valor = más castigo a asignar puntos lejos de la radicación.",
 )
+peso_dispersion = st.sidebar.number_input(
+    "Peso de dispersión",
+    min_value=0.0,
+    value=1.0,
+    step=0.5,
+    help="Mayor valor = más castigo a grupos geográficamente dispersos.",
+)
 radio_max_radicacion = st.sidebar.number_input(
     "Radio máximo de referencia desde radicación (km)",
     min_value=1.0,
     value=30.0,
     step=1.0,
 )
+modo_particion = st.sidebar.selectbox(
+    "Estrategia de partición territorial",
+    ["No partir", "Partir por municipio", "Partir por localidad"],
+    index=0,
+)
+columna_particion = None
+if modo_particion == "Partir por municipio" and "MUNICIPIO" in df_raw.columns:
+    columna_particion = "MUNICIPIO"
+elif modo_particion == "Partir por localidad" and "LOCALIDAD" in df_raw.columns:
+    columna_particion = "LOCALIDAD"
 
 with st.expander("Plantilla operativa", expanded=True):
     plantilla_default = construir_plantilla(
@@ -598,11 +763,15 @@ if run:
             lat_col=lat_col,
             lon_col=lon_col,
             peso_radicacion=float(peso_radicacion),
+            peso_dispersion=float(peso_dispersion),
+            partir_por_columna=columna_particion,
         )
-
+        asignados = recalcular_metricas_asignacion(asignados, plantilla_edit, lat_col, lon_col)
         asignados = generar_alertas(
             asignados,
             radio_max_radicacion=float(radio_max_radicacion),
+            permitir_reasignable_sin_partir=modo_particion == "No partir",
+            
         )
 
         if len(invalidos) > 0:
@@ -615,120 +784,154 @@ if run:
             invalidos["LON_RADICACION"] = np.nan
             invalidos["distancia_centroide"] = np.nan
             invalidos["distancia_radicacion_km"] = np.nan
+            invalidos["radicacion_viable"] = False
             invalidos = generar_alertas(
                 invalidos,
                 radio_max_radicacion=float(radio_max_radicacion),
+                permitir_reasignable_sin_partir=modo_particion == "No partir",
             )
             resultado = pd.concat([asignados, invalidos], ignore_index=True)
         else:
             resultado = asignados.copy()
 
-        resumen = build_summary(
-            resultado[resultado["estatus_asignacion"] == "Asignado"].copy(),
-            min_per=int(min_per),
-            max_per=int(max_per),
-            plantilla=plantilla_edit,
-        )
-
+        st.session_state["resultado_planeacion"] = resultado
+        st.session_state["plantilla_planeacion"] = plantilla_edit.copy())
         st.success("Asignación compacta generada.")
 
-        k1, k2, k3, k4 = st.columns(4)
-        with k1:
-            st.metric("Asignados", int((resultado["estatus_asignacion"] == "Asignado").sum()))
-        with k2:
-            st.metric("Sin asignar", int(resultado["asignado_a"].isna().sum()))
-        with k3:
-            st.metric("Promedio por entrevistador", round(resumen["registros"].mean(), 1) if len(resumen) else 0)
-        with k4:
-            st.metric("Máximo observado", int(resumen["registros"].max()) if len(resumen) else 0)
-
-        st.subheader("Resumen por entrevistador")
-        st.dataframe(resumen, use_container_width=True)
-
-        st.subheader("Validación visual de cargas")
-        fig_bar = px.bar(
-            resumen,
-            x="entrevistador",
-            y="registros",
-            color="estado",
-            text="registros",
-            category_orders={"entrevistador": ordenar_natural(resumen["entrevistador"].tolist())},
-            title="Registros asignados por entrevistador",
-        )
-        fig_bar.add_hline(y=min_per, line_dash="dash", annotation_text="mínimo")
-        fig_bar.add_hline(y=max_per, line_dash="dash", annotation_text="máximo")
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-        st.subheader("Mapa operativo de puntos")
-        map_df = resultado.copy()
-        map_df["grupo_mapa"] = map_df["asignado_a"].fillna(map_df["alerta"]).fillna("SIN DATOS")
-        fig_map = construir_mapa(
-            map_df[map_df[lat_col].notna() & map_df[lon_col].notna()].copy(),
-            lat_col,
-            lon_col,
-            "grupo_mapa",
-            id_col,
-        )
-        st.plotly_chart(fig_map, use_container_width=True)
-
-        st.subheader("Inconsistencias y alertas")
-        inconsistencias = (
-            resultado[resultado["alerta"] != "OK"].copy()
-            if "alerta" in resultado.columns
-            else pd.DataFrame()
-        )
-        st.dataframe(inconsistencias, use_container_width=True)
-
-        st.subheader("Detalle de registros")
-        st.dataframe(resultado, use_container_width=True)
-
-        export_bytes = dataframe_to_excel_bytes(
-            {
-                "asignacion": resultado,
-                "resumen_entrevistador": resumen,
-                "plantilla": plantilla_edit,
-                "parametros": pd.DataFrame(
-                    {
-                        "parametro": [
-                            "hoja_seleccionada",
-                            "lat_col",
-                            "lon_col",
-                            "id_col",
-                            "priority_col",
-                            "entrevistadores",
-                            "min_por_entrevistador",
-                            "max_por_entrevistador",
-                            "supervisores",
-                            "peso_radicacion",
-                            "radio_max_radicacion_km",
-                        ],
-                        "valor": [
-                            selected_sheet,
-                            lat_col,
-                            lon_col,
-                            id_col,
-                            priority_col,
-                            len(interviewer_names),
-                            min_per,
-                            max_per,
-                            num_supervisores,
-                            peso_radicacion,
-                            radio_max_radicacion,
-                        ],
-                    }
-                ),
-            }
-        )
-
-        st.download_button(
-            "Descargar resultado en Excel",
-            data=export_bytes,
-            file_name="planeacion_operativa_resultado.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-    except Exception as e:
+        except Exception as e:
         st.exception(e)
+
+    if "resultado_planeacion" in st.session_state and "plantilla_planeacion" in st.session_state:
+        resultado = st.session_state["resultado_planeacion"].copy()
+        plantilla_vigente = st.session_state["plantilla_planeacion"].copy()
+    
+        with st.expander("Reasignación manual por polígono", expanded=False):
+            st.caption("Captura puntos del polígono como: lat,lon; lat,lon; lat,lon")
+            poligono_txt = st.text_area("Polígono", value="")
+            nuevo_ent = st.selectbox("Reasignar al entrevistador", ordenar_natural(plantilla_vigente["ENTREVISTADOR"].tolist()))
+            if st.button("Aplicar reasignación por polígono"):
+                try:
+                    poligono = parse_polygon_text(poligono_txt)
+                    if len(poligono) < 3:
+                        st.warning("Debes ingresar al menos 3 vértices válidos.")
+                    else:
+                        resultado, movidos = reasignar_por_poligono(resultado, poligono, nuevo_ent, lat_col, lon_col)
+                        resultado = recalcular_metricas_asignacion(resultado, plantilla_vigente, lat_col, lon_col)
+                        resultado = generar_alertas(
+                            resultado,
+                            radio_max_radicacion=float(radio_max_radicacion),
+                            permitir_reasignable_sin_partir=modo_particion == "No partir",
+                        )
+                        st.session_state["resultado_planeacion"] = resultado
+                        st.success(f"Reasignación aplicada. Registros movidos: {movidos}.")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo aplicar la reasignación: {e}")
+    
+        resumen = build_summary(
+            resultado[resultado["asignado_a"].notna()].copy(),
+            min_per=int(min_per),
+            max_per=int(max_per),
+            plantilla=plantilla_vigente,
+        )
+k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric("Asignados", int(resultado["asignado_a"].notna().sum()))
+    with k2:
+        st.metric("Sin asignar", int(resultado["asignado_a"].isna().sum()))
+    with k3:
+        st.metric("Promedio por entrevistador", round(resumen["registros"].mean(), 1) if len(resumen) else 0)
+    with k4:
+        st.metric("Máximo observado", int(resumen["registros"].max()) if len(resumen) else 0)
+
+    st.subheader("Resumen por entrevistador")
+    st.dataframe(resumen, use_container_width=True)
+
+    st.subheader("Validación visual de cargas")
+    fig_bar = px.bar(
+        resumen,
+        x="entrevistador",
+        y="registros",
+        color="estado",
+        text="registros",
+        category_orders={"entrevistador": ordenar_natural(resumen["entrevistador"].tolist())},
+        title="Registros asignados por entrevistador",
+    )
+    fig_bar.add_hline(y=min_per, line_dash="dash", annotation_text="mínimo")
+    fig_bar.add_hline(y=max_per, line_dash="dash", annotation_text="máximo")
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+    st.subheader("Mapa operativo de puntos")
+    map_df = resultado.copy()
+    map_df["grupo_mapa"] = map_df["asignado_a"].fillna(map_df["alerta"]).fillna("SIN DATOS")
+    fig_map = construir_mapa(
+        map_df[map_df[lat_col].notna() & map_df[lon_col].notna()].copy(),
+        lat_col,
+        lon_col,
+        "grupo_mapa",
+        id_col,
+    )
+    st.plotly_chart(fig_map, use_container_width=True)
+
+   st.subheader("Inconsistencias y alertas")
+    inconsistencias = (
+        resultado[resultado["alerta"] != "OK"].copy()
+        if "alerta" in resultado.columns
+        else pd.DataFrame()
+    )
+    st.dataframe(inconsistencias, use_container_width=True)
+
+    st.subheader("Detalle de registros")
+    st.dataframe(resultado, use_container_width=True)
+
+    export_bytes = dataframe_to_excel_bytes(
+        {
+            "asignacion": resultado,
+            "resumen_entrevistador": resumen,
+            "plantilla": plantilla_vigente,
+            "parametros": pd.DataFrame(
+                {
+                    "parametro": [
+                        "hoja_seleccionada",
+                        "lat_col",
+                        "lon_col",
+                        "id_col",
+                        "priority_col",
+                        "estrategia_particion",
+                        "entrevistadores",
+                        "min_por_entrevistador",
+                        "max_por_entrevistador",
+                        "supervisores",
+                        "peso_radicacion",
+                        "peso_dispersion",
+                        "radio_max_radicacion_km",
+                    ],
+                    "valor": [
+                        selected_sheet,
+                        lat_col,
+                        lon_col,
+                        id_col,
+                        priority_col,
+                        modo_particion,
+                        len(interviewer_names),
+                        min_per,
+                        max_per,
+                        num_supervisores,
+                        peso_radicacion,
+                        peso_dispersion,
+                        radio_max_radicacion,
+                    ],
+                }
+            ),
+        }
+    )
+
+    st.download_button(
+        "Descargar resultado en Excel",
+        data=export_bytes,
+        file_name="planeacion_operativa_resultado.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 st.markdown("---")
 st.markdown(
