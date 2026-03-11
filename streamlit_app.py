@@ -1,4 +1,3 @@
-import math
 import re
 from io import BytesIO
 from typing import Optional, Tuple
@@ -107,10 +106,7 @@ def infer_geo_columns(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str], O
 def natural_key(texto):
     if pd.isna(texto):
         return ("",)
-    return tuple(
-        int(t) if t.isdigit() else t.lower()
-        for t in re.split(r"(\d+)", str(texto))
-    )
+    return tuple(int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(texto)))
 
 
 def ordenar_natural(lista):
@@ -125,26 +121,42 @@ def distancia_km(lat1, lon1, lat2, lon2):
     x = (lon2 - lon1) * np.cos((lat1 + lat2) / 2)
     y = lat2 - lat1
     return 6371 * np.sqrt(x * x + y * y)
-    
+
+
 def parse_polygon_text(texto: str) -> list[tuple[float, float]]:
     puntos = []
-    if not texto:
+    if not texto or not str(texto).strip():
         return puntos
-    for par in texto.split(";"):
-        if not par.strip():
+
+    for par in str(texto).split(";"):
+        par = par.strip()
+        if not par:
             continue
-        lat_str, lon_str = [x.strip() for x in par.split(",")]
-        puntos.append((float(lat_str), float(lon_str)))
+
+        partes = [x.strip() for x in par.split(",")]
+        if len(partes) != 2:
+            raise ValueError(f"Formato inválido en el vértice: '{par}'. Usa lat,lon")
+
+        try:
+            lat = float(partes[0])
+            lon = float(partes[1])
+        except ValueError:
+            raise ValueError(f"No se pudieron convertir a número las coordenadas: '{par}'")
+
+        puntos.append((lat, lon))
+
     return puntos
 
 
 def punto_en_poligono(lat: float, lon: float, poligono: list[tuple[float, float]]) -> bool:
     if len(poligono) < 3 or pd.isna(lat) or pd.isna(lon):
         return False
+
     dentro = False
     x = lon
     y = lat
     n = len(poligono)
+
     for i in range(n):
         y1, x1 = poligono[i]
         y2, x2 = poligono[(i + 1) % n]
@@ -210,6 +222,8 @@ def generar_alertas(
         df["distancia_centroide"] = np.nan
     if "distancia_radicacion_km" not in df.columns:
         df["distancia_radicacion_km"] = np.nan
+    if "radicacion_viable" not in df.columns:
+        df["radicacion_viable"] = False
 
     df["alerta"] = "OK"
     df.loc[~df["coord_no_nulas"], "alerta"] = "COORDENADAS VACIAS"
@@ -222,10 +236,7 @@ def generar_alertas(
     validas = df["coord_valida"] & df["distancia_centroide"].notna()
     if validas.any():
         umbral = df.loc[validas, "distancia_centroide"].quantile(0.98)
-        df.loc[
-            validas & (df["distancia_centroide"] > umbral),
-            "alerta"
-        ] = "REVISAR DISPERSION"
+        df.loc[validas & (df["distancia_centroide"] > umbral), "alerta"] = "REVISAR DISPERSION"
 
     mask_rad = (
         df["distancia_radicacion_km"].notna()
@@ -237,6 +248,7 @@ def generar_alertas(
         df.loc[mask_rad & (df["alerta"] == "OK"), "alerta"] = "LEJOS DE RADICACION"
     else:
         df.loc[mask_rad & (df["alerta"] == "OK"), "alerta"] = "LEJOS DE RADICACION"
+
     return df
 
 
@@ -246,11 +258,13 @@ def asignacion_balanceada_geografica(
     lat_col: str,
     lon_col: str,
     peso_radicacion: float = 2.0,
+    peso_dispersion: float = 1.0,
+    partir_por_columna: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Asignación compacta con capacidad:
+    Asignación compacta con capacidad balanceada:
     - inicia con centroides geográficos
-    - incorpora radicación del entrevistador y dispersion
+    - incorpora radicación del entrevistador y dispersión
     - asigna respetando cupos balanceados
     - itera para compactar
     """
@@ -262,13 +276,25 @@ def asignacion_balanceada_geografica(
 
     n = len(df_validos)
     k = len(entrevistadores)
+
+    if n == 0:
+        df_validos["asignado_a"] = None
+        df_validos["estatus_asignacion"] = "Sin registros"
+        return df_validos
+
+    if k == 0:
+        raise ValueError("No hay entrevistadores en la plantilla.")
+
+    if n < k:
+        raise ValueError("No hay suficientes registros válidos para asignar al menos uno por entrevistador.")
+
     coords = df_validos[[lat_col, lon_col]].to_numpy()
 
     modelo = KMeans(n_clusters=k, random_state=42, n_init=15)
     labels_init = modelo.fit_predict(coords)
     centroides = modelo.cluster_centers_.copy()
-    
-   if partir_por_columna and partir_por_columna in df_validos.columns:
+
+    if partir_por_columna and partir_por_columna in df_validos.columns:
         grupos = df_validos[partir_por_columna].fillna("SIN_DATO").astype(str)
         codigos = pd.factorize(grupos)[0]
         grupo_objetivo = {}
@@ -282,6 +308,7 @@ def asignacion_balanceada_geografica(
     else:
         codigos = np.zeros(n, dtype=int)
         grupo_objetivo = {ent: 0 for ent in entrevistadores}
+
     base_cupo = n // k
     residuo = n % k
     cupos = {
@@ -296,7 +323,9 @@ def asignacion_balanceada_geografica(
         costo_cluster = np.sqrt(
             ((coords[:, None, :] - centroides[None, :, :]) ** 2).sum(axis=2)
         )
+
         costo_radicacion = np.zeros((n, k))
+        costo_dispersion = np.zeros((n, k))
 
         for j in range(k):
             costo_radicacion[:, j] = distancia_km(
@@ -312,6 +341,7 @@ def asignacion_balanceada_geografica(
                 centro_ent = coords[mask].mean(axis=0)
             else:
                 centro_ent = centroides[j]
+
             d_geo = np.sqrt(((coords - centro_ent) ** 2).sum(axis=1))
             d_geo = d_geo - d_geo.min()
             denom = d_geo.max() if d_geo.max() > 0 else 1.0
@@ -322,8 +352,13 @@ def asignacion_balanceada_geografica(
             for j, ent in enumerate(entrevistadores):
                 costo_particion[:, j] = (codigos != grupo_objetivo[ent]).astype(float) * 5.0
 
-        costo_total = costo_cluster + (peso_radicacion * costo_radicacion / 100.0) + (peso_dispersion * costo_dispersion) + costo_particion
-        
+        costo_total = (
+            costo_cluster
+            + (peso_radicacion * costo_radicacion / 100.0)
+            + (peso_dispersion * costo_dispersion)
+            + costo_particion
+        )
+
         preferencias = np.argsort(costo_total, axis=1)
 
         nuevos_asignados = [None] * n
@@ -355,13 +390,60 @@ def asignacion_balanceada_geografica(
 
     df_validos["asignado_a"] = asignados
 
+    mapa_sup = dict(zip(plantilla["ENTREVISTADOR"], plantilla["SUPERV"]))
+    mapa_roe = dict(zip(plantilla["ENTREVISTADOR"], plantilla["ROE"]))
+    mapa_mun = dict(zip(plantilla["ENTREVISTADOR"], plantilla["MUNICIPIO_RADICACION"]))
+    mapa_lat_rad = dict(zip(plantilla["ENTREVISTADOR"], plantilla["LAT_RADICACION"]))
+    mapa_lon_rad = dict(zip(plantilla["ENTREVISTADOR"], plantilla["LON_RADICACION"]))
+
+    df_validos["SUPERV"] = df_validos["asignado_a"].map(mapa_sup)
+    df_validos["ROE"] = df_validos["asignado_a"].map(mapa_roe)
+    df_validos["MUNICIPIO_RADICACION"] = df_validos["asignado_a"].map(mapa_mun)
+    df_validos["LAT_RADICACION"] = df_validos["asignado_a"].map(mapa_lat_rad)
+    df_validos["LON_RADICACION"] = df_validos["asignado_a"].map(mapa_lon_rad)
+
+    centroides_finales = {}
+    for ent in entrevistadores:
+        subset = df_validos[df_validos["asignado_a"] == ent]
+        if len(subset) > 0:
+            centroides_finales[ent] = (
+                subset[lat_col].mean(),
+                subset[lon_col].mean(),
+            )
+
+    df_validos["distancia_centroide"] = df_validos.apply(
+        lambda row: np.sqrt(
+            (row[lat_col] - centroides_finales[row["asignado_a"]][0]) ** 2
+            + (row[lon_col] - centroides_finales[row["asignado_a"]][1]) ** 2
+        )
+        if row["asignado_a"] in centroides_finales
+        else np.nan,
+        axis=1,
+    )
+
+    df_validos["distancia_radicacion_km"] = df_validos.apply(
+        lambda row: distancia_km(
+            row[lat_col],
+            row[lon_col],
+            row["LAT_RADICACION"],
+            row["LON_RADICACION"],
+        ),
+        axis=1,
+    )
+
+    df_validos["estatus_asignacion"] = "Asignado"
+    return df_validos
+
+
 def recalcular_metricas_asignacion(
     df: pd.DataFrame,
     plantilla: pd.DataFrame,
     lat_col: str,
     lon_col: str,
+    radio_max_radicacion: float = 30.0,
 ) -> pd.DataFrame:
     out = df.copy()
+
     mapa_sup = dict(zip(plantilla["ENTREVISTADOR"], plantilla["SUPERV"]))
     mapa_roe = dict(zip(plantilla["ENTREVISTADOR"], plantilla["ROE"]))
     mapa_mun = dict(zip(plantilla["ENTREVISTADOR"], plantilla["MUNICIPIO_RADICACION"]))
@@ -399,16 +481,20 @@ def recalcular_metricas_asignacion(
             row["LON_RADICACION"],
         )
         if pd.notna(row["asignado_a"])
+        and pd.notna(row["LAT_RADICACION"])
+        and pd.notna(row["LON_RADICACION"])
         else np.nan,
         axis=1,
     )
 
     out["radicacion_viable"] = False
     asignables = out[out["coord_valida"]].copy()
-    if len(asignables) > 0:
+
+    if len(asignables) > 0 and len(plantilla) > 0:
         rad_coords = plantilla[["LAT_RADICACION", "LON_RADICACION"]].to_numpy()
         puntos = asignables[[lat_col, lon_col]].to_numpy()
         dist_matrix = np.zeros((len(puntos), len(rad_coords)))
+
         for j in range(len(rad_coords)):
             dist_matrix[:, j] = distancia_km(
                 puntos[:, 0],
@@ -416,7 +502,9 @@ def recalcular_metricas_asignacion(
                 rad_coords[j, 0],
                 rad_coords[j, 1],
             )
-        out.loc[asignables.index, "radicacion_viable"] = np.isfinite(dist_matrix.min(axis=1))
+
+        min_dist = dist_matrix.min(axis=1)
+        out.loc[asignables.index, "radicacion_viable"] = min_dist <= radio_max_radicacion
 
     return out
 
@@ -433,47 +521,6 @@ def reasignar_por_poligono(
     out.loc[mask, "asignado_a"] = nuevo_entrevistador
     out.loc[mask, "estatus_asignacion"] = "Asignado (manual polígono)"
     return out, int(mask.sum())
-
-    mapa_sup = dict(zip(plantilla["ENTREVISTADOR"], plantilla["SUPERV"]))
-    mapa_roe = dict(zip(plantilla["ENTREVISTADOR"], plantilla["ROE"]))
-    mapa_mun = dict(zip(plantilla["ENTREVISTADOR"], plantilla["MUNICIPIO_RADICACION"]))
-    mapa_lat_rad = dict(zip(plantilla["ENTREVISTADOR"], plantilla["LAT_RADICACION"]))
-    mapa_lon_rad = dict(zip(plantilla["ENTREVISTADOR"], plantilla["LON_RADICACION"]))
-
-    df_validos["SUPERV"] = df_validos["asignado_a"].map(mapa_sup)
-    df_validos["ROE"] = df_validos["asignado_a"].map(mapa_roe)
-    df_validos["MUNICIPIO_RADICACION"] = df_validos["asignado_a"].map(mapa_mun)
-    df_validos["LAT_RADICACION"] = df_validos["asignado_a"].map(mapa_lat_rad)
-    df_validos["LON_RADICACION"] = df_validos["asignado_a"].map(mapa_lon_rad)
-
-    centroides_finales = {}
-    for ent in entrevistadores:
-        subset = df_validos[df_validos["asignado_a"] == ent]
-        centroides_finales[ent] = (
-            subset[lat_col].mean(),
-            subset[lon_col].mean(),
-        )
-
-    df_validos["distancia_centroide"] = df_validos.apply(
-        lambda row: np.sqrt(
-            (row[lat_col] - centroides_finales[row["asignado_a"]][0]) ** 2
-            + (row[lon_col] - centroides_finales[row["asignado_a"]][1]) ** 2
-        ),
-        axis=1,
-    )
-
-    df_validos["distancia_radicacion_km"] = df_validos.apply(
-        lambda row: distancia_km(
-            row[lat_col],
-            row[lon_col],
-            row["LAT_RADICACION"],
-            row["LON_RADICACION"],
-        ),
-        axis=1,
-    )
-
-    df_validos["estatus_asignacion"] = "Asignado"
-    return df_validos
 
 
 def build_summary(
@@ -531,31 +578,32 @@ def construir_mapa(
     id_col: Optional[str],
 ):
     category_orders = {}
-       if color_col in df.columns:
+    if color_col in df.columns:
+        valores = df[color_col].dropna().unique().tolist()
         entrevistadores = [
-            x for x in df[color_col].dropna().unique().tolist()
+            x for x in valores
             if isinstance(x, str) and re.match(r"^E\d+$", x)
         ]
-        otros = [x for x in df[color_col].dropna().unique().tolist() if x not in entrevistadores]
-        category_orders[color_col] = ordenar_natural(entrevistadores) + sorted(otros)
+        otros = [x for x in valores if x not in entrevistadores]
+        category_orders[color_col] = ordenar_natural(entrevistadores) + sorted(map(str, otros))
 
-    fig = px.scatter_map(
+    fig = px.scatter_mapbox(
         df,
         lat=lat_col,
         lon=lon_col,
         color=color_col,
         category_orders=category_orders,
-        hover_name=id_col if id_col in df.columns else None,
+        hover_name=id_col if id_col is not None and id_col in df.columns else None,
         hover_data={
-            "asignado_a": True if "asignado_a" in df.columns else False,
-            "SUPERV": True if "SUPERV" in df.columns else False,
-            "ROE": True if "ROE" in df.columns else False,
-            "MUNICIPIO_RADICACION": True if "MUNICIPIO_RADICACION" in df.columns else False,
-            "distancia_radicacion_km": True if "distancia_radicacion_km" in df.columns else False,
-            "alerta": True if "alerta" in df.columns else False,
+            "asignado_a": "asignado_a" in df.columns,
+            "SUPERV": "SUPERV" in df.columns,
+            "ROE": "ROE" in df.columns,
+            "MUNICIPIO_RADICACION": "MUNICIPIO_RADICACION" in df.columns,
+            "distancia_radicacion_km": "distancia_radicacion_km" in df.columns,
+            "alerta": "alerta" in df.columns,
         },
         zoom=6,
-        height=950,
+        height=900,
         title="Puntos asignados en Sinaloa",
     )
 
@@ -570,22 +618,24 @@ def construir_mapa(
             )
             .reset_index()
         )
-        resumen_mapa["orden_ent"] = resumen_mapa["asignado_a"].map(natural_key)
-        resumen_mapa = resumen_mapa.sort_values("orden_ent")
 
-        fig.add_trace(
-            go.Scattermap(
-                lat=resumen_mapa["latitud"],
-                lon=resumen_mapa["longitud"],
-                mode="text",
-                text=[f"{r.asignado_a}: {int(r.registros)}" for r in resumen_mapa.itertuples()],
-                textfont={"size": 13},
-                hoverinfo="skip",
-                showlegend=False,
+        if not resumen_mapa.empty:
+            resumen_mapa["orden_ent"] = resumen_mapa["asignado_a"].map(natural_key)
+            resumen_mapa = resumen_mapa.sort_values("orden_ent")
+
+            fig.add_trace(
+                go.Scattermapbox(
+                    lat=resumen_mapa["latitud"],
+                    lon=resumen_mapa["longitud"],
+                    mode="text",
+                    text=[f"{r.asignado_a}: {int(r.registros)}" for r in resumen_mapa.itertuples()],
+                    textfont={"size": 13},
+                    hoverinfo="skip",
+                    showlegend=False,
+                )
             )
-        )
 
-    fig.update_layout(map_style="carto-positron")
+    fig.update_layout(mapbox_style="carto-positron")
     fig.update_layout(margin={"r": 0, "t": 50, "l": 0, "b": 0})
     return fig
 
@@ -653,7 +703,7 @@ min_per = st.sidebar.number_input("Mínimo por entrevistador", min_value=0, valu
 max_per = st.sidebar.number_input("Máximo por entrevistador", min_value=1, value=60, step=1)
 num_supervisores = st.sidebar.number_input("Supervisores", min_value=1, value=3, step=1)
 peso_radicacion = st.sidebar.number_input(
-    "Peso de radicación vs dispersión",
+    "Peso de radicación",
     min_value=0.0,
     value=2.5,
     step=0.5,
@@ -672,11 +722,13 @@ radio_max_radicacion = st.sidebar.number_input(
     value=30.0,
     step=1.0,
 )
+
 modo_particion = st.sidebar.selectbox(
     "Estrategia de partición territorial",
     ["No partir", "Partir por municipio", "Partir por localidad"],
     index=0,
 )
+
 columna_particion = None
 if modo_particion == "Partir por municipio" and "MUNICIPIO" in df_raw.columns:
     columna_particion = "MUNICIPIO"
@@ -726,6 +778,10 @@ if not lat_col or not lon_col:
     st.error("Selecciona las columnas de latitud y longitud para continuar.")
     st.stop()
 
+if int(min_per) > int(max_per):
+    st.error("El mínimo por entrevistador no puede ser mayor que el máximo.")
+    st.stop()
+
 df_geo = clean_geo(df_raw, lat_col, lon_col)
 
 c1, c2, c3 = st.columns(3)
@@ -751,14 +807,30 @@ if run:
             st.stop()
 
         capacidad_total = len(interviewer_names) * int(max_per)
+
+        if priority_col is not None and priority_col in validos.columns:
+            try:
+                validos["_priority_num"] = pd.to_numeric(validos[priority_col], errors="coerce")
+                if validos["_priority_num"].notna().any():
+                    validos = validos.sort_values("_priority_num", ascending=False).drop(columns="_priority_num")
+                else:
+                    validos = validos.sort_values(priority_col, ascending=False, kind="stable")
+            except Exception:
+                pass
+
         if len(validos) > capacidad_total:
             st.warning(
                 f"Hay {len(validos):,} registros válidos y la capacidad máxima es {capacidad_total:,}. "
-                "En esta versión se reparte de forma balanceada entre todos los entrevistadores disponibles."
+                "Se asignarán hasta la capacidad máxima y el resto quedará sin asignar."
             )
+            validos_asignables = validos.iloc[:capacidad_total].copy()
+            validos_sobrantes = validos.iloc[capacidad_total:].copy()
+        else:
+            validos_asignables = validos.copy()
+            validos_sobrantes = pd.DataFrame(columns=validos.columns)
 
         asignados = asignacion_balanceada_geografica(
-            validos,
+            validos_asignables,
             plantilla_edit,
             lat_col=lat_col,
             lon_col=lon_col,
@@ -766,15 +838,40 @@ if run:
             peso_dispersion=float(peso_dispersion),
             partir_por_columna=columna_particion,
         )
-        asignados = recalcular_metricas_asignacion(asignados, plantilla_edit, lat_col, lon_col)
+
+        asignados = recalcular_metricas_asignacion(
+            asignados,
+            plantilla_edit,
+            lat_col,
+            lon_col,
+            radio_max_radicacion=float(radio_max_radicacion),
+        )
+
         asignados = generar_alertas(
             asignados,
             radio_max_radicacion=float(radio_max_radicacion),
             permitir_reasignable_sin_partir=modo_particion == "No partir",
-            
         )
 
+        partes_resultado = [asignados]
+
+        if len(validos_sobrantes) > 0:
+            validos_sobrantes = validos_sobrantes.copy()
+            validos_sobrantes["asignado_a"] = None
+            validos_sobrantes["estatus_asignacion"] = "Sin asignar por capacidad máxima"
+            validos_sobrantes["SUPERV"] = None
+            validos_sobrantes["ROE"] = None
+            validos_sobrantes["MUNICIPIO_RADICACION"] = None
+            validos_sobrantes["LAT_RADICACION"] = np.nan
+            validos_sobrantes["LON_RADICACION"] = np.nan
+            validos_sobrantes["distancia_centroide"] = np.nan
+            validos_sobrantes["distancia_radicacion_km"] = np.nan
+            validos_sobrantes["radicacion_viable"] = False
+            validos_sobrantes["alerta"] = "SIN CAPACIDAD"
+            partes_resultado.append(validos_sobrantes)
+
         if len(invalidos) > 0:
+            invalidos = invalidos.copy()
             invalidos["asignado_a"] = None
             invalidos["estatus_asignacion"] = "Coordenada inválida o a revisar"
             invalidos["SUPERV"] = None
@@ -790,51 +887,62 @@ if run:
                 radio_max_radicacion=float(radio_max_radicacion),
                 permitir_reasignable_sin_partir=modo_particion == "No partir",
             )
-            resultado = pd.concat([asignados, invalidos], ignore_index=True)
-        else:
-            resultado = asignados.copy()
+            partes_resultado.append(invalidos)
+
+        resultado = pd.concat(partes_resultado, ignore_index=True)
 
         st.session_state["resultado_planeacion"] = resultado
-        st.session_state["plantilla_planeacion"] = plantilla_edit.copy())
+        st.session_state["plantilla_planeacion"] = plantilla_edit.copy()
         st.success("Asignación compacta generada.")
 
-        except Exception as e:
+    except Exception as e:
         st.exception(e)
 
-    if "resultado_planeacion" in st.session_state and "plantilla_planeacion" in st.session_state:
-        resultado = st.session_state["resultado_planeacion"].copy()
-        plantilla_vigente = st.session_state["plantilla_planeacion"].copy()
-    
-        with st.expander("Reasignación manual por polígono", expanded=False):
-            st.caption("Captura puntos del polígono como: lat,lon; lat,lon; lat,lon")
-            poligono_txt = st.text_area("Polígono", value="")
-            nuevo_ent = st.selectbox("Reasignar al entrevistador", ordenar_natural(plantilla_vigente["ENTREVISTADOR"].tolist()))
-            if st.button("Aplicar reasignación por polígono"):
-                try:
-                    poligono = parse_polygon_text(poligono_txt)
-                    if len(poligono) < 3:
-                        st.warning("Debes ingresar al menos 3 vértices válidos.")
-                    else:
-                        resultado, movidos = reasignar_por_poligono(resultado, poligono, nuevo_ent, lat_col, lon_col)
-                        resultado = recalcular_metricas_asignacion(resultado, plantilla_vigente, lat_col, lon_col)
-                        resultado = generar_alertas(
-                            resultado,
-                            radio_max_radicacion=float(radio_max_radicacion),
-                            permitir_reasignable_sin_partir=modo_particion == "No partir",
-                        )
-                        st.session_state["resultado_planeacion"] = resultado
-                        st.success(f"Reasignación aplicada. Registros movidos: {movidos}.")
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"No se pudo aplicar la reasignación: {e}")
-    
-        resumen = build_summary(
-            resultado[resultado["asignado_a"].notna()].copy(),
-            min_per=int(min_per),
-            max_per=int(max_per),
-            plantilla=plantilla_vigente,
+if "resultado_planeacion" in st.session_state and "plantilla_planeacion" in st.session_state:
+    resultado = st.session_state["resultado_planeacion"].copy()
+    plantilla_vigente = st.session_state["plantilla_planeacion"].copy()
+
+    with st.expander("Reasignación manual por polígono", expanded=False):
+        st.caption("Captura puntos del polígono como: lat,lon; lat,lon; lat,lon")
+        poligono_txt = st.text_area("Polígono", value="")
+        nuevo_ent = st.selectbox(
+            "Reasignar al entrevistador",
+            ordenar_natural(plantilla_vigente["ENTREVISTADOR"].tolist())
         )
-k1, k2, k3, k4 = st.columns(4)
+
+        if st.button("Aplicar reasignación por polígono"):
+            try:
+                poligono = parse_polygon_text(poligono_txt)
+                if len(poligono) < 3:
+                    st.warning("Debes ingresar al menos 3 vértices válidos.")
+                else:
+                    resultado, movidos = reasignar_por_poligono(resultado, poligono, nuevo_ent, lat_col, lon_col)
+                    resultado = recalcular_metricas_asignacion(
+                        resultado,
+                        plantilla_vigente,
+                        lat_col,
+                        lon_col,
+                        radio_max_radicacion=float(radio_max_radicacion),
+                    )
+                    resultado = generar_alertas(
+                        resultado,
+                        radio_max_radicacion=float(radio_max_radicacion),
+                        permitir_reasignable_sin_partir=modo_particion == "No partir",
+                    )
+                    st.session_state["resultado_planeacion"] = resultado
+                    st.success(f"Reasignación aplicada. Registros movidos: {movidos}.")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo aplicar la reasignación: {e}")
+
+    resumen = build_summary(
+        resultado[resultado["asignado_a"].notna()].copy(),
+        min_per=int(min_per),
+        max_per=int(max_per),
+        plantilla=plantilla_vigente,
+    )
+
+    k1, k2, k3, k4 = st.columns(4)
     with k1:
         st.metric("Asignados", int(resultado["asignado_a"].notna().sum()))
     with k2:
@@ -873,7 +981,7 @@ k1, k2, k3, k4 = st.columns(4)
     )
     st.plotly_chart(fig_map, use_container_width=True)
 
-   st.subheader("Inconsistencias y alertas")
+    st.subheader("Inconsistencias y alertas")
     inconsistencias = (
         resultado[resultado["alerta"] != "OK"].copy()
         if "alerta" in resultado.columns
