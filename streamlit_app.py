@@ -1,6 +1,8 @@
 import re
+import zipfile
 from io import BytesIO
 from typing import Optional, Tuple
+from xml.sax.saxutils import escape
 
 import folium
 import numpy as np
@@ -8,10 +10,9 @@ import pandas as pd
 import streamlit as st
 from folium.features import DivIcon
 from folium.plugins import Draw, Fullscreen
-from sklearn.cluster import KMeans
 from streamlit_folium import st_folium
 
-st.set_page_config(page_title="Planeación operativa", layout="wide")
+st.set_page_config(page_title="Planeación operativa - INEGI - 2026", layout="wide")
 
 # ============================================================
 # Catálogos y constantes
@@ -94,6 +95,9 @@ PALETTE = [
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#393b79", "#637939",
     "#8c6d31", "#843c39", "#7b4173", "#3182bd", "#31a354", "#756bb1",
 ]
+
+WEEK_COLS = ["SEMANA_RECORRIDO", "SEMANA_NUM", "ORDEN_SEMANA"]
+
 
 # ============================================================
 # Utilidades
@@ -244,44 +248,21 @@ def region_from_point(lat: float, lon: float) -> str:
     return REGION_MUNICIPIO.get(mun, "SIN_REGION")
 
 
-def compute_capacities(n: int, entrevistadores: list[str], min_per: int, max_per: int) -> dict[str, int]:
+def soft_targets(n: int, entrevistadores: list[str], min_per: int, max_per: int) -> dict[str, int]:
     k = len(entrevistadores)
     if k == 0:
         return {}
 
-    n_asignable = min(n, k * max_per)
-    base = n_asignable // k
-    residuo = n_asignable % k
+    ideal = n / k
+    base = int(np.floor(ideal))
+    residuo = int(n - base * k)
 
-    caps = {}
+    targets = {}
     for i, ent in enumerate(entrevistadores):
-        cap = base + (1 if i < residuo else 0)
-        cap = max(cap, min_per)
-        cap = min(cap, max_per)
-        caps[ent] = cap
-
-    total = sum(caps.values())
-
-    if total > n_asignable:
-        excedente = total - n_asignable
-        for ent in reversed(entrevistadores):
-            reducible = max(caps[ent] - min_per, 0)
-            delta = min(reducible, excedente)
-            caps[ent] -= delta
-            excedente -= delta
-            if excedente == 0:
-                break
-    elif total < n_asignable:
-        faltante = n_asignable - total
-        for ent in entrevistadores:
-            expandible = max(max_per - caps[ent], 0)
-            delta = min(expandible, faltante)
-            caps[ent] += delta
-            faltante -= delta
-            if faltante == 0:
-                break
-
-    return caps
+        val = base + (1 if i < residuo else 0)
+        val = min(val, max_per)
+        targets[ent] = max(val, min(min_per, max_per, max(0, int(np.floor(ideal)))))
+    return targets
 
 
 def build_knn_indices(coords: np.ndarray, k_neighbors: int = 8) -> np.ndarray:
@@ -294,6 +275,442 @@ def build_knn_indices(coords: np.ndarray, k_neighbors: int = 8) -> np.ndarray:
     np.fill_diagonal(d2, np.inf)
     k_use = min(k_neighbors, n - 1)
     return np.argsort(d2, axis=1)[:, :k_use]
+
+
+def standardize_xy(coords: np.ndarray) -> np.ndarray:
+    if len(coords) == 0:
+        return coords.copy()
+    mu = coords.mean(axis=0)
+    sd = coords.std(axis=0)
+    sd[sd == 0] = 1.0
+    return (coords - mu) / sd
+
+
+def latlon_to_local_xy(lat: np.ndarray, lon: np.ndarray, ref_lat: float, ref_lon: float) -> np.ndarray:
+    lat_r = np.radians(lat)
+    lon_r = np.radians(lon)
+    ref_lat_r = np.radians(ref_lat)
+    ref_lon_r = np.radians(ref_lon)
+
+    x = (lon_r - ref_lon_r) * np.cos((lat_r + ref_lat_r) / 2.0) * 6371.0
+    y = (lat_r - ref_lat_r) * 6371.0
+    return np.column_stack([x, y])
+
+
+def group_indices_by_base(rad: np.ndarray, decimals: int = 5) -> dict[tuple[float, float], list[int]]:
+    groups = {}
+    for j, (la, lo) in enumerate(rad):
+        key = (round(float(la), decimals), round(float(lo), decimals))
+        groups.setdefault(key, []).append(j)
+    return groups
+
+
+def partition_contiguous(order_idx: np.ndarray, quotas: list[int]) -> list[np.ndarray]:
+    parts = []
+    start = 0
+    n = len(order_idx)
+    for i, q in enumerate(quotas):
+        if i == len(quotas) - 1:
+            end = n
+        else:
+            end = start + int(q)
+        parts.append(order_idx[start:end])
+        start = end
+    return parts
+
+
+def contiguous_sector_assignment(
+    coords_group: np.ndarray,
+    ent_names_group: list[str],
+    quota_map: dict[str, int],
+    base_lat: float,
+    base_lon: float,
+) -> dict[int, str]:
+    n = len(coords_group)
+    if n == 0:
+        return {}
+
+    if len(ent_names_group) == 1:
+        return {i: ent_names_group[0] for i in range(n)}
+
+    local_xy = latlon_to_local_xy(coords_group[:, 0], coords_group[:, 1], base_lat, base_lon)
+    ang = np.mod(np.arctan2(local_xy[:, 1], local_xy[:, 0]), 2 * np.pi)
+    rad = np.sqrt((local_xy ** 2).sum(axis=1))
+
+    ent_sorted = ordenar_natural(ent_names_group)
+    quotas = [int(quota_map[e]) for e in ent_sorted]
+
+    order0 = np.lexsort((rad, ang))
+    best_cost = None
+    best_parts = None
+
+    n_trials = min(24, max(n, 1))
+    starts = np.linspace(0, n - 1, n_trials, dtype=int) if n > 0 else np.array([0], dtype=int)
+
+    for s in starts:
+        rolled = np.roll(order0, -int(s))
+        parts = partition_contiguous(rolled, quotas)
+
+        cost = 0.0
+        for part in parts:
+            if len(part) <= 1:
+                continue
+            pts = local_xy[part]
+            centro = pts.mean(axis=0)
+            cost += float(((pts - centro) ** 2).sum())
+
+        if best_cost is None or cost < best_cost:
+            best_cost = cost
+            best_parts = parts
+
+    assignment_local = {}
+    for ent, part in zip(ent_sorted, best_parts):
+        for idx_local in part:
+            assignment_local[int(idx_local)] = ent
+
+    return assignment_local
+
+
+def quotas_for_group(n_points: int, ent_names_group: list[str], soft_target_map: dict[str, int], max_per: int) -> dict[str, int]:
+    if len(ent_names_group) == 0:
+        return {}
+
+    hard_caps = {e: max_per for e in ent_names_group}
+    weights = np.array([max(soft_target_map.get(e, 1), 1) for e in ent_names_group], dtype=float)
+    weights = weights / weights.sum()
+
+    raw = weights * n_points
+    floors = np.floor(raw).astype(int)
+    resid = int(n_points - floors.sum())
+
+    quotas = {e: int(f) for e, f in zip(ent_names_group, floors)}
+
+    if resid > 0:
+        frac = raw - floors
+        order = np.argsort(frac)[::-1]
+        for idx in order[:resid]:
+            quotas[ent_names_group[int(idx)]] += 1
+
+    for e in ent_names_group:
+        quotas[e] = min(quotas[e], hard_caps[e])
+
+    total = sum(quotas.values())
+    if total < n_points:
+        faltan = n_points - total
+        for e in ent_names_group:
+            disp = hard_caps[e] - quotas[e]
+            add = min(disp, faltan)
+            quotas[e] += add
+            faltan -= add
+            if faltan == 0:
+                break
+
+    return quotas
+
+
+# ============================================================
+# Planeación semanal y exportación Google Earth
+# ============================================================
+def drop_week_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    cols_drop = [c for c in WEEK_COLS if c in out.columns]
+    if cols_drop:
+        out = out.drop(columns=cols_drop)
+    return out
+
+
+def even_quotas(n: int, k: int) -> list[int]:
+    if k <= 0:
+        return []
+    base = n // k
+    resid = n % k
+    return [base + (1 if i < resid else 0) for i in range(k)]
+
+
+def assign_weeks_compact_for_interviewer(
+    sub: pd.DataFrame,
+    lat_col: str,
+    lon_col: str,
+    base_lat: float,
+    base_lon: float,
+    n_weeks: int,
+) -> pd.DataFrame:
+    out = sub.copy().reset_index(drop=False).rename(columns={"index": "_orig_idx"})
+    n = len(out)
+
+    if n == 0:
+        out["SEMANA_NUM"] = np.nan
+        out["SEMANA_RECORRIDO"] = None
+        out["ORDEN_SEMANA"] = np.nan
+        return out
+
+    n_weeks_use = max(1, min(int(n_weeks), n))
+    coords = out[[lat_col, lon_col]].to_numpy(dtype=float)
+
+    local_xy = latlon_to_local_xy(
+        coords[:, 0],
+        coords[:, 1],
+        float(base_lat),
+        float(base_lon),
+    )
+    ang = np.mod(np.arctan2(local_xy[:, 1], local_xy[:, 0]), 2 * np.pi)
+    rad = np.sqrt((local_xy ** 2).sum(axis=1))
+
+    order0 = np.lexsort((rad, ang))
+    quotas = even_quotas(n, n_weeks_use)
+
+    best_cost = None
+    best_parts = None
+
+    n_trials = min(max(n, 1), 24)
+    starts = np.linspace(0, max(n - 1, 0), n_trials, dtype=int)
+
+    for s in starts:
+        rolled = np.roll(order0, -int(s))
+        parts = []
+        start = 0
+        for i, q in enumerate(quotas):
+            end = start + q if i < len(quotas) - 1 else n
+            parts.append(rolled[start:end])
+            start = end
+
+        cost = 0.0
+        for part in parts:
+            if len(part) <= 1:
+                continue
+            pts = local_xy[part]
+            centro = pts.mean(axis=0)
+            cost += float(((pts - centro) ** 2).sum())
+
+        if best_cost is None or cost < best_cost:
+            best_cost = cost
+            best_parts = parts
+
+    semana_num = np.zeros(n, dtype=int)
+    orden_semana = np.zeros(n, dtype=int)
+
+    for w, part in enumerate(best_parts, start=1):
+        if len(part) == 0:
+            continue
+
+        pts = local_xy[part]
+        rad_part = np.sqrt((pts ** 2).sum(axis=1))
+        ang_part = np.mod(np.arctan2(pts[:, 1], pts[:, 0]), 2 * np.pi)
+
+        local_order = np.lexsort((rad_part, ang_part))
+        ordered_idx = np.array(part)[local_order]
+
+        for pos, idx_local in enumerate(ordered_idx, start=1):
+            semana_num[idx_local] = w
+            orden_semana[idx_local] = pos
+
+    out["SEMANA_NUM"] = semana_num
+    out["SEMANA_RECORRIDO"] = out["SEMANA_NUM"].map(lambda x: f"Semana {int(x)}" if pd.notna(x) and x > 0 else None)
+    out["ORDEN_SEMANA"] = orden_semana
+
+    out = out.sort_values(["SEMANA_NUM", "ORDEN_SEMANA"]).reset_index(drop=True)
+    return out
+
+
+def assign_route_weeks(
+    df_resultado: pd.DataFrame,
+    plantilla: pd.DataFrame,
+    lat_col: str,
+    lon_col: str,
+    n_weeks: int,
+) -> pd.DataFrame:
+    out = drop_week_columns(df_resultado.copy())
+
+    if "asignado_a" not in out.columns:
+        return out
+
+    asignados = out[out["asignado_a"].notna()].copy()
+
+    if len(asignados) == 0:
+        out["SEMANA_NUM"] = np.nan
+        out["SEMANA_RECORRIDO"] = None
+        out["ORDEN_SEMANA"] = np.nan
+        return out
+
+    mapa_lat = dict(zip(plantilla["ENTREVISTADOR"], plantilla["LAT_RADICACION"]))
+    mapa_lon = dict(zip(plantilla["ENTREVISTADOR"], plantilla["LON_RADICACION"]))
+
+    piezas = []
+
+    for ent in ordenar_natural(asignados["asignado_a"].dropna().unique().tolist()):
+        sub = asignados[asignados["asignado_a"] == ent].copy()
+        base_lat = mapa_lat.get(ent, sub[lat_col].mean())
+        base_lon = mapa_lon.get(ent, sub[lon_col].mean())
+
+        sub_week = assign_weeks_compact_for_interviewer(
+            sub=sub,
+            lat_col=lat_col,
+            lon_col=lon_col,
+            base_lat=base_lat,
+            base_lon=base_lon,
+            n_weeks=n_weeks,
+        )
+        piezas.append(sub_week)
+
+    asignados_week = pd.concat(piezas, ignore_index=True)
+
+    if "_orig_idx" in asignados_week.columns:
+        asignados_week = asignados_week.set_index("_orig_idx")
+
+    out = out.reset_index(drop=False).rename(columns={"index": "_orig_idx"}).set_index("_orig_idx")
+
+    for col in ["SEMANA_NUM", "SEMANA_RECORRIDO", "ORDEN_SEMANA"]:
+        out[col] = np.nan if col != "SEMANA_RECORRIDO" else None
+
+    for col in ["SEMANA_NUM", "SEMANA_RECORRIDO", "ORDEN_SEMANA"]:
+        out.loc[asignados_week.index, col] = asignados_week[col]
+
+    out = out.reset_index(drop=True)
+    return out
+
+
+def build_week_summary(df_resultado: pd.DataFrame) -> pd.DataFrame:
+    if "SEMANA_RECORRIDO" not in df_resultado.columns:
+        return pd.DataFrame()
+
+    df = df_resultado[df_resultado["asignado_a"].notna() & df_resultado["SEMANA_RECORRIDO"].notna()].copy()
+    if len(df) == 0:
+        return pd.DataFrame()
+
+    resumen = (
+        df.groupby(["asignado_a", "SUPERV", "ROE", "MUNICIPIO_RADICACION", "SEMANA_NUM", "SEMANA_RECORRIDO"], dropna=False)
+        .size()
+        .reset_index(name="registros")
+        .rename(columns={"asignado_a": "entrevistador"})
+        .sort_values(["entrevistador", "SEMANA_NUM"])
+        .reset_index(drop=True)
+    )
+    return resumen
+
+
+def kml_color_from_hex(hex_color: str, alpha: str = "ff") -> str:
+    c = (hex_color or "#808080").replace("#", "").strip()
+    if len(c) != 6:
+        c = "808080"
+    rr = c[0:2]
+    gg = c[2:4]
+    bb = c[4:6]
+    return f"{alpha}{bb}{gg}{rr}"
+
+
+def safe_html_value(v) -> str:
+    if pd.isna(v):
+        return ""
+    return escape(str(v))
+
+
+def build_kml_description(row: pd.Series, fields: list[str]) -> str:
+    rows = []
+    for col in fields:
+        if col in row.index:
+            rows.append(
+                f"<tr><td><b>{escape(str(col))}</b></td><td>{safe_html_value(row[col])}</td></tr>"
+            )
+
+    html = (
+        "<![CDATA["
+        "<div style='font-family:Arial,sans-serif;font-size:12px;'>"
+        "<table border='1' cellspacing='0' cellpadding='4' style='border-collapse:collapse;'>"
+        + "".join(rows) +
+        "</table>"
+        "</div>"
+        "]]>"
+    )
+    return html
+
+
+def dataframe_to_kml_string(
+    df: pd.DataFrame,
+    lat_col: str,
+    lon_col: str,
+    id_col: Optional[str],
+    popup_fields: list[str],
+) -> str:
+    df_exp = df[df[lat_col].notna() & df[lon_col].notna()].copy()
+
+    style_map = {}
+    ents = ordenar_natural(df_exp["asignado_a"].fillna("SIN_ASIGNAR").astype(str).unique().tolist())
+    for ent in ents:
+        color = color_for_entity(ent) if ent != "SIN_ASIGNAR" else "#808080"
+        style_map[ent] = kml_color_from_hex(color)
+
+    lines = []
+    lines.append('<?xml version="1.0" encoding="UTF-8"?>')
+    lines.append('<kml xmlns="http://www.opengis.net/kml/2.2">')
+    lines.append("<Document>")
+    lines.append("<name>Planeacion operativa</name>")
+
+    for ent in ents:
+        style_id = f"style_{re.sub(r'[^A-Za-z0-9_]+', '_', str(ent))}"
+        kml_color = style_map[ent]
+        lines.append(f'<Style id="{style_id}">')
+        lines.append("<IconStyle>")
+        lines.append(f"<color>{kml_color}</color>")
+        lines.append("<scale>1.1</scale>")
+        lines.append("<Icon><href>http://maps.google.com/mapfiles/kml/shapes/shaded_dot.png</href></Icon>")
+        lines.append("</IconStyle>")
+        lines.append("<LabelStyle><scale>0</scale></LabelStyle>")
+        lines.append("</Style>")
+
+    for ent in ents:
+        style_id = f"style_{re.sub(r'[^A-Za-z0-9_]+', '_', str(ent))}"
+        sub = df_exp[df_exp["asignado_a"].fillna("SIN_ASIGNAR").astype(str) == ent].copy()
+
+        lines.append("<Folder>")
+        lines.append(f"<name>{escape(str(ent))}</name>")
+
+        for _, row in sub.iterrows():
+            lat = float(row[lat_col])
+            lon = float(row[lon_col])
+
+            if id_col is not None and id_col in row.index and pd.notna(row[id_col]):
+                point_name = str(row[id_col])
+            else:
+                point_name = f"{ent}"
+
+            desc = build_kml_description(row, popup_fields)
+
+            lines.append("<Placemark>")
+            lines.append(f"<name>{escape(point_name)}</name>")
+            lines.append(f"<styleUrl>#{style_id}</styleUrl>")
+            lines.append(f"<description>{desc}</description>")
+            lines.append("<Point>")
+            lines.append(f"<coordinates>{lon},{lat},0</coordinates>")
+            lines.append("</Point>")
+            lines.append("</Placemark>")
+
+        lines.append("</Folder>")
+
+    lines.append("</Document>")
+    lines.append("</kml>")
+    return "\n".join(lines)
+
+
+def dataframe_to_kmz_bytes(
+    df: pd.DataFrame,
+    lat_col: str,
+    lon_col: str,
+    id_col: Optional[str],
+    popup_fields: list[str],
+) -> bytes:
+    kml_text = dataframe_to_kml_string(
+        df=df,
+        lat_col=lat_col,
+        lon_col=lon_col,
+        id_col=id_col,
+        popup_fields=popup_fields,
+    )
+
+    output = BytesIO()
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("doc.kml", kml_text.encode("utf-8"))
+    output.seek(0)
+    return output.read()
 
 
 # ============================================================
@@ -351,7 +768,7 @@ def extract_shape_selector(feature: dict):
 
 
 # ============================================================
-# Algoritmo fuerte de agrupamiento compacto y balanceado
+# Algoritmo definitivo: radicación dura + compactación
 # ============================================================
 def compact_balanced_assignment(
     df_validos: pd.DataFrame,
@@ -361,15 +778,10 @@ def compact_balanced_assignment(
     min_per: int,
     max_per: int,
     priority_col: Optional[str] = None,
+    hard_max_km: float = 120.0,
+    slack_nearest_km: float = 25.0,
+    cross_region_max_km: float = 45.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Objetivos:
-    - mantener cargas equilibradas sin ser rígidamente idénticas
-    - priorizar cercanía a radicación
-    - formar clústeres compactos
-    - reducir fragmentación con penalización vecinal
-    - mejorar con relocalizaciones y swaps locales
-    """
     df = df_validos.copy().reset_index(drop=True)
     pl = plantilla.copy()
 
@@ -379,247 +791,230 @@ def compact_balanced_assignment(
 
     pl = pl.set_index("ENTREVISTADOR").loc[entrevistadores].reset_index()
 
-    prioridad = prioridad_serie(df, priority_col)
-    df["_priority_score"] = prioridad
+    df["_priority_score"] = prioridad_serie(df, priority_col).astype(float)
     df["_region_punto"] = df.apply(lambda r: region_from_point(r[lat_col], r[lon_col]), axis=1)
     pl["_region_base"] = pl["MUNICIPIO_RADICACION"].map(lambda x: REGION_MUNICIPIO.get(x, "SIN_REGION"))
 
+    n = len(df)
+    if n == 0:
+        df["asignado_a"] = None
+        df["estatus_asignacion"] = "Sin registros"
+        return df.iloc[0:0].copy(), df.iloc[0:0].copy()
+
     capacidad_total = len(entrevistadores) * int(max_per)
 
+    coords = df[[lat_col, lon_col]].to_numpy(dtype=float)
+    rad_ent = pl[["LAT_RADICACION", "LON_RADICACION"]].to_numpy(dtype=float)
+
+    dist_ent_all = np.zeros((n, len(entrevistadores)), dtype=float)
+    for j in range(len(entrevistadores)):
+        dist_ent_all[:, j] = distancia_km(coords[:, 0], coords[:, 1], rad_ent[j, 0], rad_ent[j, 1])
+
+    nearest_any = dist_ent_all.min(axis=1)
+
+    df = df.assign(_nearest_base_km=nearest_any)
     df = df.sort_values(
-        by=["_priority_score", lat_col, lon_col],
-        ascending=[False, True, True],
+        by=["_priority_score", "_nearest_base_km"],
+        ascending=[False, False],
         kind="stable"
     ).reset_index(drop=True)
 
     if len(df) > capacidad_total:
         df_asignable = df.iloc[:capacidad_total].copy()
-        df_exceso = df.iloc[capacidad_total:].copy()
+        df_exceso_cap = df.iloc[capacidad_total:].copy()
+        df_exceso_cap["asignado_a"] = None
+        df_exceso_cap["estatus_asignacion"] = "Sin asignar por capacidad máxima"
     else:
         df_asignable = df.copy()
-        df_exceso = pd.DataFrame(columns=df.columns)
+        df_exceso_cap = df.iloc[0:0].copy()
 
-    n = len(df_asignable)
-    k = len(entrevistadores)
-    caps = compute_capacities(n, entrevistadores, min_per, max_per)
+    if len(df_asignable) == 0:
+        return df_asignable, df_exceso_cap
 
-    if n == 0:
-        df_asignable["asignado_a"] = None
-        df_asignable["estatus_asignacion"] = "Sin registros"
-        return df_asignable, df_exceso
+    soft_target_map = soft_targets(len(df_asignable), entrevistadores, min_per, max_per)
+    hard_cap_map = {e: int(max_per) for e in entrevistadores}
 
-    coords = df_asignable[[lat_col, lon_col]].to_numpy(dtype=float)
     rad = pl[["LAT_RADICACION", "LON_RADICACION"]].to_numpy(dtype=float)
+    base_groups = group_indices_by_base(rad, decimals=5)
 
-    # Distancia a radicación
-    dist_base = np.zeros((n, k), dtype=float)
-    for j in range(k):
-        dist_base[:, j] = distancia_km(coords[:, 0], coords[:, 1], rad[j, 0], rad[j, 1])
+    group_keys = list(base_groups.keys())
+    group_meta = []
 
-    # kNN para contigüidad
-    knn_idx = build_knn_indices(coords, k_neighbors=8)
+    for g_idx, key in enumerate(group_keys):
+        ent_js = base_groups[key]
+        ent_names = [entrevistadores[j] for j in ent_js]
+        base_lat, base_lon = key
+        hard_cap_total = sum(hard_cap_map[e] for e in ent_names)
+        soft_target_total = sum(soft_target_map.get(e, 0) for e in ent_names)
+        region_base = REGION_MUNICIPIO.get(pl.loc[ent_js[0], "MUNICIPIO_RADICACION"], "SIN_REGION")
 
-    # Semilla geográfica
-    try:
-        n_clusters = min(max(k, 2), min(n, k + 4))
-        km = KMeans(n_clusters=n_clusters, random_state=42, n_init=15)
-        seed_labels = km.fit_predict(coords)
-        seed_centroids = km.cluster_centers_
-    except Exception:
-        seed_labels = np.zeros(n, dtype=int)
-        seed_centroids = np.array([[coords[:, 0].mean(), coords[:, 1].mean()]])
+        group_meta.append(
+            {
+                "group_idx": g_idx,
+                "key": key,
+                "ent_js": ent_js,
+                "ent_names": ent_names,
+                "base_lat": float(base_lat),
+                "base_lon": float(base_lon),
+                "hard_cap_total": int(hard_cap_total),
+                "soft_target_total": int(soft_target_total),
+                "region_base": region_base,
+            }
+        )
 
-    # Centroides iniciales por entrevistador:
-    # mezcla entre radicación y centroides geográficos más cercanos
-    centroides = np.zeros((k, 2), dtype=float)
-    seed_taken = set()
-    for j in range(k):
-        seed_d = np.array([
-            float(distancia_km(rad[j, 0], rad[j, 1], c[0], c[1]))
-            for c in seed_centroids
-        ])
-        order = np.argsort(seed_d)
-        chosen = None
-        for idx in order:
-            if idx not in seed_taken:
-                chosen = idx
-                break
-        if chosen is None:
-            chosen = int(order[0])
-        seed_taken.add(chosen)
-        centroides[j] = 0.55 * rad[j] + 0.45 * seed_centroids[chosen]
+    n_asig = len(df_asignable)
+    coords_asig = df_asignable[[lat_col, lon_col]].to_numpy(dtype=float)
+    point_regions = df_asignable["_region_punto"].to_numpy(dtype=object)
+    priorities = df_asignable["_priority_score"].to_numpy(dtype=float)
 
-    # Costos base
-    def compute_cost_matrix(assignments: np.ndarray, centroides_local: np.ndarray) -> np.ndarray:
-        dist_cent = np.zeros((n, k), dtype=float)
-        for j in range(k):
-            dist_cent[:, j] = distancia_km(
-                coords[:, 0], coords[:, 1],
-                centroides_local[j, 0], centroides_local[j, 1]
-            )
+    gcount = len(group_meta)
+    dist_group = np.zeros((n_asig, gcount), dtype=float)
 
-        cost = np.zeros((n, k), dtype=float)
-        for j in range(k):
-            rb = pl.loc[j, "_region_base"]
-            region_pen = np.where(df_asignable["_region_punto"].to_numpy() == rb, 0.0, 70.0)
+    for g, meta in enumerate(group_meta):
+        dist_group[:, g] = distancia_km(
+            coords_asig[:, 0],
+            coords_asig[:, 1],
+            meta["base_lat"],
+            meta["base_lon"],
+        )
 
-            # salto largo fuerte
-            long_pen = np.where(
-                dist_base[:, j] > 140, 800.0,
-                np.where(dist_base[:, j] > 100, 240.0,
-                         np.where(dist_base[:, j] > 80, 80.0, 0.0))
-            )
+    nearest_group_dist = dist_group.min(axis=1)
 
-            # prioridad: si es importante, castiga más irse lejos
-            prio_mult = 1.0 + np.clip(df_asignable["_priority_score"].to_numpy(), 0, 5) * 0.06
+    feasible = np.zeros((n_asig, gcount), dtype=bool)
 
-            cost[:, j] = (
-                0.60 * dist_cent[:, j]
-                + 0.40 * dist_base[:, j] * prio_mult
-                + region_pen
-                + long_pen
-            )
+    for i in range(n_asig):
+        dmin = nearest_group_dist[i]
+        for g, meta in enumerate(group_meta):
+            d = dist_group[i, g]
+            same_region = point_regions[i] == meta["region_base"]
 
-        # penalización de fragmentación vecinal según asignación actual
-        if assignments is not None and len(knn_idx) > 0:
-            for i in range(n):
-                neigh = knn_idx[i]
-                neigh_asig = assignments[neigh]
-                for j in range(k):
-                    ent = entrevistadores[j]
-                    frac_diff = np.mean(neigh_asig != ent) if len(neigh_asig) > 0 else 0.0
-                    cost[i, j] += 22.0 * frac_diff
-        return cost
+            if d > hard_max_km:
+                continue
+            if d > dmin + slack_nearest_km:
+                continue
+            if (not same_region) and d > cross_region_max_km:
+                continue
 
-    # Asignación inicial greedy capacitada
-    caps_arr = np.array([caps[e] for e in entrevistadores], dtype=int)
-    ocup = np.zeros(k, dtype=int)
-    assignments = np.array([""] * n, dtype=object)
-    cost0 = compute_cost_matrix(None, centroides)
+            feasible[i, g] = True
 
-    # Orden: puntos difíciles primero
-    spread = np.partition(cost0, 1, axis=1)[:, 1] - np.min(cost0, axis=1) if k > 1 else np.zeros(n)
-    order_points = np.lexsort((np.min(cost0, axis=1), spread, -df_asignable["_priority_score"].to_numpy()))
+    group_loads = np.zeros(gcount, dtype=int)
+    point_to_group = np.full(n_asig, -1, dtype=int)
+
+    order_points = np.lexsort((
+        nearest_group_dist,
+        -priorities,
+    ))
 
     for i in order_points:
-        order_j = np.argsort(cost0[i])
-        chosen = None
-        for j in order_j:
-            if ocup[j] < caps_arr[j]:
-                chosen = j
-                break
-        if chosen is None:
-            chosen = int(np.argmin(cost0[i]))
-        assignments[i] = entrevistadores[chosen]
-        ocup[chosen] += 1
+        cand_groups = np.where(feasible[i])[0]
 
-    # Refinamiento iterativo
-    ent_to_idx = {e: j for j, e in enumerate(entrevistadores)}
+        if len(cand_groups) == 0:
+            continue
 
-    def recompute_centroids(assignments_local: np.ndarray, centroides_prev: np.ndarray) -> np.ndarray:
-        cent = centroides_prev.copy()
-        for j, ent in enumerate(entrevistadores):
-            mask = assignments_local == ent
-            if mask.any():
-                pts = coords[mask]
-                mean_pt = pts.mean(axis=0)
-                base_pt = rad[j]
-                # ancla moderada a base para compactar sin olvidar radicación
-                cent[j] = 0.78 * mean_pt + 0.22 * base_pt
-        return cent
+        best_g = None
+        best_cost = None
 
-    def total_cost(assignments_local: np.ndarray, centroides_local: np.ndarray) -> float:
-        cmat = compute_cost_matrix(assignments_local, centroides_local)
-        return float(sum(cmat[i, ent_to_idx[assignments_local[i]]] for i in range(n)))
+        for g in cand_groups:
+            meta = group_meta[g]
 
-    centroides = recompute_centroids(assignments, centroides)
-    best_assign = assignments.copy()
-    best_cent = centroides.copy()
-    best_cost = total_cost(best_assign, best_cent)
+            if group_loads[g] >= meta["hard_cap_total"]:
+                continue
 
-    # Reasignación + local search
-    for _ in range(10):
-        centroides = recompute_centroids(assignments, centroides)
-        cmat = compute_cost_matrix(assignments, centroides)
+            d = dist_group[i, g]
+            load_ratio = group_loads[g] / max(meta["hard_cap_total"], 1)
 
-        ocup = np.array([(assignments == e).sum() for e in entrevistadores], dtype=int)
+            region_pen = 0.0 if point_regions[i] == meta["region_base"] else 70.0
+            prio_mult = 1.0 + np.clip(priorities[i], 0, 5) * 0.08
 
-        moved = 0
-        point_order = np.argsort([
-            cmat[i, ent_to_idx[assignments[i]]]
-            for i in range(n)
-        ])[::-1]
+            dist_pen = 0.0
+            if d > 90:
+                dist_pen += 120.0 + (d - 90) * 3.0
+            elif d > 70:
+                dist_pen += 35.0 + (d - 70) * 1.6
+            elif d > 45:
+                dist_pen += (d - 45) * 0.8
 
-        # Relocalización simple
-        for i in point_order:
-            cur_e = assignments[i]
-            cur_j = ent_to_idx[cur_e]
-            cur_cost = cmat[i, cur_j]
+            soft_over_pen = 18.0 * (load_ratio ** 2.0)
 
-            order_j = np.argsort(cmat[i])
-            for j in order_j:
-                if j == cur_j:
-                    continue
-                if ocup[j] >= caps_arr[j]:
-                    continue
-                if cmat[i, j] + 1e-9 < cur_cost - 6.0:
-                    assignments[i] = entrevistadores[j]
-                    ocup[cur_j] -= 1
-                    ocup[j] += 1
-                    moved += 1
-                    break
+            soft_target_total = max(meta["soft_target_total"], 1)
+            soft_ratio = group_loads[g] / soft_target_total
+            soft_balance_pen = 10.0 * max(soft_ratio - 1.0, 0.0) ** 2
 
-        centroides = recompute_centroids(assignments, centroides)
-        cmat = compute_cost_matrix(assignments, centroides)
+            cost = (
+                d * prio_mult
+                + region_pen
+                + dist_pen
+                + soft_over_pen
+                + soft_balance_pen
+            )
 
-        # Swaps locales
-        for _swap_round in range(2):
-            changed_swap = 0
-            worst_idx = np.argsort([
-                cmat[i, ent_to_idx[assignments[i]]]
-                for i in range(n)
-            ])[::-1][: min(120, n)]
+            if best_cost is None or cost < best_cost:
+                best_cost = cost
+                best_g = g
 
-            for i in worst_idx:
-                ei = assignments[i]
-                ji = ent_to_idx[ei]
-                ci = cmat[i, ji]
+        if best_g is not None:
+            point_to_group[i] = best_g
+            group_loads[best_g] += 1
 
-                for t in knn_idx[i] if len(knn_idx) > 0 else []:
-                    et = assignments[t]
-                    if et == ei:
-                        continue
-                    jt = ent_to_idx[et]
-                    ct = cmat[t, jt]
+    assigned_mask = point_to_group >= 0
+    df_group_assigned = df_asignable.loc[assigned_mask].copy().reset_index(drop=False).rename(columns={"index": "_orig_idx"})
+    df_group_unassigned = df_asignable.loc[~assigned_mask].copy()
 
-                    new_cost = cmat[i, jt] + cmat[t, ji]
-                    old_cost = ci + ct
+    if len(df_group_unassigned) > 0:
+        df_group_unassigned["asignado_a"] = None
+        df_group_unassigned["estatus_asignacion"] = "Sin radicación viable"
 
-                    if new_cost + 1e-9 < old_cost - 8.0:
-                        assignments[i], assignments[t] = assignments[t], assignments[i]
-                        changed_swap += 1
-                        break
+    final_assignments = pd.Series(index=df_group_assigned.index, dtype=object)
 
-            if changed_swap == 0:
-                break
+    for g, meta in enumerate(group_meta):
+        idx_global = np.where(point_to_group == g)[0]
+        if len(idx_global) == 0:
+            continue
 
-        centroides = recompute_centroids(assignments, centroides)
-        cur_cost = total_cost(assignments, centroides)
+        sub = df_asignable.iloc[idx_global].copy().reset_index(drop=True)
+        coords_group = sub[[lat_col, lon_col]].to_numpy(dtype=float)
 
-        if cur_cost + 1e-9 < best_cost:
-            best_cost = cur_cost
-            best_assign = assignments.copy()
-            best_cent = centroides.copy()
+        ent_names_group = meta["ent_names"]
+        quota_map = quotas_for_group(
+            n_points=len(sub),
+            ent_names_group=ent_names_group,
+            soft_target_map=soft_target_map,
+            max_per=max_per,
+        )
 
-        if moved == 0:
-            break
+        local_assign = contiguous_sector_assignment(
+            coords_group=coords_group,
+            ent_names_group=ent_names_group,
+            quota_map=quota_map,
+            base_lat=meta["base_lat"],
+            base_lon=meta["base_lon"],
+        )
 
-    assignments = best_assign
-    centroides = best_cent
+        for local_i, ent in local_assign.items():
+            orig_i = idx_global[local_i]
+            rows = df_group_assigned.index[df_group_assigned["_orig_idx"] == orig_i].tolist()
+            if rows:
+                final_assignments.loc[rows[0]] = ent
 
-    df_asignable["asignado_a"] = assignments
-    df_asignable["estatus_asignacion"] = "Asignado"
-    return df_asignable, df_exceso
+    df_group_assigned["asignado_a"] = final_assignments.values
+    df_group_assigned["estatus_asignacion"] = "Asignado"
+
+    still_na = df_group_assigned["asignado_a"].isna()
+    if still_na.any():
+        extra_na = df_group_assigned.loc[still_na].copy()
+        extra_na["estatus_asignacion"] = "Sin asignar por sectorización"
+        df_group_assigned = df_group_assigned.loc[~still_na].copy()
+        if len(df_group_unassigned) == 0:
+            df_group_unassigned = extra_na.copy()
+        else:
+            df_group_unassigned = pd.concat([df_group_unassigned, extra_na.drop(columns=["_orig_idx"], errors="ignore")], ignore_index=True)
+
+    if "_orig_idx" in df_group_assigned.columns:
+        df_group_assigned = df_group_assigned.drop(columns=["_orig_idx"])
+
+    df_unassigned = pd.concat([df_group_unassigned, df_exceso_cap], ignore_index=True)
+
+    return df_group_assigned.reset_index(drop=True), df_unassigned.reset_index(drop=True)
 
 
 def recalcular_metricas_asignacion(
@@ -679,7 +1074,7 @@ def recalcular_metricas_asignacion(
         axis=1,
     )
 
-    out["radicacion_viable"] = out["distancia_radicacion_km"].fillna(np.inf) <= 70
+    out["radicacion_viable"] = out["distancia_radicacion_km"].fillna(np.inf) <= 120
     return out
 
 
@@ -692,6 +1087,9 @@ def generar_alertas(df: pd.DataFrame) -> pd.DataFrame:
         out["distancia_radicacion_km"] = np.nan
     if "radicacion_viable" not in out.columns:
         out["radicacion_viable"] = False
+
+    if "estatus_asignacion" not in out.columns:
+        out["estatus_asignacion"] = None
 
     out["alerta"] = "OK"
     out.loc[~out["coord_no_nulas"], "alerta"] = "COORDENADAS VACIAS"
@@ -706,8 +1104,11 @@ def generar_alertas(df: pd.DataFrame) -> pd.DataFrame:
         umbral_disp = out.loc[validas, "distancia_centroide"].quantile(0.98)
         out.loc[validas & (out["distancia_centroide"] > umbral_disp), "alerta"] = "REVISAR DISPERSION"
 
+    out.loc[(out["alerta"] == "OK") & (out["estatus_asignacion"] == "Sin radicación viable"), "alerta"] = "SIN RADICACION VIABLE"
+    out.loc[(out["alerta"] == "OK") & (out["estatus_asignacion"] == "Sin asignar por capacidad máxima"), "alerta"] = "SIN CAPACIDAD"
     out.loc[(out["alerta"] == "OK") & (out["distancia_radicacion_km"] > 70), "alerta"] = "LEJOS DE RADICACION"
-    out.loc[(out["alerta"] == "OK") & (out["distancia_radicacion_km"] > 100), "alerta"] = "ASIGNACION CRITICA"
+    out.loc[(out["alerta"] == "OK") & (out["distancia_radicacion_km"] > 95), "alerta"] = "ASIGNACION CRITICA"
+    out.loc[(out["alerta"] == "OK") & (out["distancia_radicacion_km"] > 120), "alerta"] = "ASIGNACION CRITICA"
     return out
 
 
@@ -811,7 +1212,6 @@ def build_folium_map(
         df = df[df["SUPERV"] == superv_filter]
         pl = pl[pl["SUPERV"] == superv_filter]
 
-    # automático: si seleccionas entrevistadores, solo ellos aparecen
     if entrevistadores_focus:
         df = df[df["asignado_a"].isin(entrevistadores_focus)]
         pl = pl[pl["ENTREVISTADOR"].isin(entrevistadores_focus)]
@@ -881,6 +1281,8 @@ def build_folium_map(
             f"<b>Supervisor:</b> {getattr(row, 'SUPERV', None)}<br>"
             f"<b>ROE:</b> {getattr(row, 'ROE', None)}<br>"
             f"<b>Radicación:</b> {getattr(row, 'MUNICIPIO_RADICACION', None)}<br>"
+            f"<b>Semana:</b> {getattr(row, 'SEMANA_RECORRIDO', None)}<br>"
+            f"<b>Orden semana:</b> {getattr(row, 'ORDEN_SEMANA', None)}<br>"
             f"<b>Dist. base:</b> {round(getattr(row, 'distancia_radicacion_km', np.nan), 1) if pd.notna(getattr(row, 'distancia_radicacion_km', np.nan)) else 'NA'} km<br>"
             f"<b>Alerta:</b> {alerta}"
         )
@@ -984,14 +1386,14 @@ def render_side_cards(resumen_panel: pd.DataFrame):
 # ============================================================
 st.title("Planeación operativa de entrevistadores")
 st.caption(
-    "Planeación automática compacta, balanceada y orientada a minimizar traslados, gasolina y fragmentación territorial."
+    "Asignación con radicación dura, compactación territorial, semanas de recorrido y exportación a Google Earth Pro."
 )
 
 uploaded = st.file_uploader("Sube tu archivo Excel", type=["xlsx", "xlsm", "xls"])
 
 if uploaded is None:
     st.info(
-        "La aplicación detecta columnas geográficas, genera una planeación compacta y permite redistribuir puntos directamente sobre el mapa."
+        "La aplicación detecta columnas geográficas, genera una planeación compacta, permite redistribuir puntos en el mapa, asignar semanas y exportar a Google Earth Pro."
     )
     st.stop()
 
@@ -1038,8 +1440,13 @@ priority_col = st.sidebar.selectbox(
 st.sidebar.subheader("Capacidad operativa")
 num_interviewers = st.sidebar.number_input("Número de entrevistadores", min_value=1, value=6, step=1)
 num_supervisores = st.sidebar.number_input("Supervisores", min_value=1, value=3, step=1)
-min_per = st.sidebar.number_input("Mínimo por entrevistador", min_value=0, value=80, step=1)
-max_per = st.sidebar.number_input("Máximo por entrevistador", min_value=1, value=115, step=1)
+min_per = st.sidebar.number_input("Mínimo por entrevistador (meta suave)", min_value=0, value=80, step=1)
+max_per = st.sidebar.number_input("Máximo por entrevistador (límite duro)", min_value=1, value=115, step=1)
+
+st.sidebar.subheader("Restricciones geográficas")
+hard_max_km = st.sidebar.number_input("Distancia máxima viable a radicación (km)", min_value=10.0, value=120.0, step=5.0)
+slack_nearest_km = st.sidebar.number_input("Holgura respecto a la base más cercana (km)", min_value=0.0, value=25.0, step=5.0)
+cross_region_max_km = st.sidebar.number_input("Máximo permitido si cambia de región (km)", min_value=0.0, value=45.0, step=5.0)
 
 if not lat_col or not lon_col:
     st.error("Selecciona las columnas de latitud y longitud para continuar.")
@@ -1088,11 +1495,11 @@ if run:
         validos = df_work[df_work["coord_valida"]].copy()
         invalidos = df_work[~df_work["coord_valida"]].copy()
 
-        if len(validos) < len(plantilla_edit):
-            st.error("No hay suficientes registros válidos para asignar al menos un registro por entrevistador.")
+        if len(validos) == 0:
+            st.error("No hay registros válidos con coordenadas.")
             st.stop()
 
-        asignados, exceso = compact_balanced_assignment(
+        asignados, no_asignados = compact_balanced_assignment(
             validos,
             plantilla_edit,
             lat_col=lat_col,
@@ -1100,6 +1507,9 @@ if run:
             min_per=int(min_per),
             max_per=int(max_per),
             priority_col=priority_col,
+            hard_max_km=float(hard_max_km),
+            slack_nearest_km=float(slack_nearest_km),
+            cross_region_max_km=float(cross_region_max_km),
         )
 
         asignados = recalcular_metricas_asignacion(asignados, plantilla_edit, lat_col, lon_col)
@@ -1107,10 +1517,14 @@ if run:
 
         piezas = [asignados]
 
-        if len(exceso) > 0:
-            exceso = preparar_sin_asignar(exceso, "Sin asignar por capacidad máxima")
-            exceso["alerta"] = "SIN CAPACIDAD"
-            piezas.append(exceso)
+        if len(no_asignados) > 0:
+            if "estatus_asignacion" not in no_asignados.columns:
+                no_asignados = preparar_sin_asignar(no_asignados, "Sin asignar")
+            else:
+                no_asignados = preparar_sin_asignar(no_asignados, "Sin asignar")
+                # restaurar estatus originales si existían
+            no_asignados = generar_alertas(no_asignados)
+            piezas.append(no_asignados)
 
         if len(invalidos) > 0:
             invalidos = preparar_sin_asignar(invalidos, "Coordenada inválida o a revisar")
@@ -1118,6 +1532,9 @@ if run:
             piezas.append(invalidos)
 
         resultado = pd.concat(piezas, ignore_index=True)
+        resultado = drop_week_columns(resultado)
+        resultado = generar_alertas(resultado)
+
         st.session_state["resultado_planeacion"] = resultado
         st.session_state["plantilla_planeacion"] = plantilla_edit.copy()
         st.success("Planeación generada correctamente.")
@@ -1161,6 +1578,7 @@ entrevistadores_focus = flt3.multiselect(
 )
 
 resumen = build_summary(resultado, plantilla_vigente)
+resumen_semanal = build_week_summary(resultado)
 
 left_map, right_panel = st.columns([3.6, 1.1], gap="large")
 
@@ -1240,6 +1658,7 @@ with right_panel:
                     target_ent,
                     entrevistadores_visibles=visibles,
                 )
+                nuevo_resultado = drop_week_columns(nuevo_resultado)
                 st.session_state["resultado_planeacion"] = nuevo_resultado
                 st.success(f"Reasignación aplicada. Registros movidos: {movidos}.")
                 st.rerun()
@@ -1254,7 +1673,7 @@ with right_panel:
             validos = df_work[df_work["coord_valida"]].copy()
             invalidos = df_work[~df_work["coord_valida"]].copy()
 
-            asignados, exceso = compact_balanced_assignment(
+            asignados, no_asignados = compact_balanced_assignment(
                 validos,
                 plantilla_vigente,
                 lat_col=lat_col,
@@ -1262,6 +1681,9 @@ with right_panel:
                 min_per=int(min_per),
                 max_per=int(max_per),
                 priority_col=priority_col,
+                hard_max_km=float(hard_max_km),
+                slack_nearest_km=float(slack_nearest_km),
+                cross_region_max_km=float(cross_region_max_km),
             )
 
             asignados = recalcular_metricas_asignacion(asignados, plantilla_vigente, lat_col, lon_col)
@@ -1269,10 +1691,10 @@ with right_panel:
 
             piezas = [asignados]
 
-            if len(exceso) > 0:
-                exceso = preparar_sin_asignar(exceso, "Sin asignar por capacidad máxima")
-                exceso["alerta"] = "SIN CAPACIDAD"
-                piezas.append(exceso)
+            if len(no_asignados) > 0:
+                no_asignados = preparar_sin_asignar(no_asignados, "Sin asignar")
+                no_asignados = generar_alertas(no_asignados)
+                piezas.append(no_asignados)
 
             if len(invalidos) > 0:
                 invalidos = preparar_sin_asignar(invalidos, "Coordenada inválida o a revisar")
@@ -1280,11 +1702,54 @@ with right_panel:
                 piezas.append(invalidos)
 
             resultado_reset = pd.concat(piezas, ignore_index=True)
+            resultado_reset = drop_week_columns(resultado_reset)
             st.session_state["resultado_planeacion"] = resultado_reset
             st.success("Planeación restablecida.")
             st.rerun()
         except Exception as e:
             st.error(f"No se pudo restablecer la planeación: {e}")
+
+st.markdown("---")
+st.subheader("Asignación de semanas de recorrido")
+
+wk1, wk2, wk3 = st.columns([1, 1, 1.4])
+
+num_weeks = wk1.number_input(
+    "Número de semanas",
+    min_value=1,
+    value=4,
+    step=1,
+    key="num_weeks_planeacion",
+)
+
+solo_asignados_actuales = wk2.checkbox(
+    "Usar planeación final actual",
+    value=True,
+    key="solo_asignados_actuales",
+)
+
+if wk3.button("Generar semanas de recorrido", type="primary"):
+    try:
+        base_df = st.session_state["resultado_planeacion"].copy() if solo_asignados_actuales else resultado.copy()
+        base_df = drop_week_columns(base_df)
+
+        resultado_semanas = assign_route_weeks(
+            df_resultado=base_df,
+            plantilla=plantilla_vigente,
+            lat_col=lat_col,
+            lon_col=lon_col,
+            n_weeks=int(num_weeks),
+        )
+
+        st.session_state["resultado_planeacion"] = resultado_semanas
+        st.success("Semanas de recorrido generadas correctamente.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"No se pudieron generar las semanas: {e}")
+
+resultado = st.session_state["resultado_planeacion"].copy()
+resumen = build_summary(resultado, plantilla_vigente)
+resumen_semanal = build_week_summary(resultado)
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Asignados", int(resultado["asignado_a"].notna().sum()))
@@ -1301,22 +1766,29 @@ k4.metric(
     if "alerta" in resultado.columns else 0
 )
 
-tab1, tab2, tab3 = st.tabs(["Resumen operativo", "Alertas", "Detalle de registros"])
+tab1, tab2, tab3, tab4 = st.tabs(["Resumen operativo", "Resumen semanal", "Alertas", "Detalle de registros"])
 
 with tab1:
     st.dataframe(resumen, use_container_width=True)
 
 with tab2:
+    if resumen_semanal.empty:
+        st.info("Aún no se han asignado semanas de recorrido.")
+    else:
+        st.dataframe(resumen_semanal, use_container_width=True)
+
+with tab3:
     inconsistencias = resultado[resultado["alerta"] != "OK"].copy() if "alerta" in resultado.columns else pd.DataFrame()
     st.dataframe(inconsistencias, use_container_width=True)
 
-with tab3:
+with tab4:
     st.dataframe(resultado, use_container_width=True, height=520)
 
 export_bytes = dataframe_to_excel_bytes(
     {
         "asignacion": resultado,
         "resumen_entrevistador": resumen,
+        "resumen_semanal": resumen_semanal,
         "plantilla": plantilla_vigente,
         "parametros": pd.DataFrame(
             {
@@ -1328,8 +1800,11 @@ export_bytes = dataframe_to_excel_bytes(
                     "priority_col",
                     "entrevistadores",
                     "supervisores",
-                    "min_por_entrevistador",
-                    "max_por_entrevistador",
+                    "min_por_entrevistador_meta_suave",
+                    "max_por_entrevistador_limite_duro",
+                    "dist_max_radicacion_km",
+                    "holgura_base_mas_cercana_km",
+                    "max_si_cambia_region_km",
                 ],
                 "valor": [
                     selected_sheet,
@@ -1341,6 +1816,9 @@ export_bytes = dataframe_to_excel_bytes(
                     plantilla_vigente["SUPERV"].nunique(),
                     min_per,
                     max_per,
+                    hard_max_km,
+                    slack_nearest_km,
+                    cross_region_max_km,
                 ],
             }
         ),
@@ -1355,12 +1833,58 @@ st.download_button(
 )
 
 st.markdown("---")
+st.subheader("Descarga para Google Earth Pro")
+
+default_popup_fields = []
+for c in [
+    id_col,
+    "asignado_a",
+    "SUPERV",
+    "ROE",
+    "MUNICIPIO_RADICACION",
+    "SEMANA_RECORRIDO",
+    "ORDEN_SEMANA",
+    "distancia_radicacion_km",
+    "alerta",
+    priority_col,
+]:
+    if c is not None and c in resultado.columns and c not in default_popup_fields:
+        default_popup_fields.append(c)
+
+extra_candidates = [c for c in df_raw.columns if c not in default_popup_fields][:6]
+default_popup_fields.extend(extra_candidates)
+
+popup_fields = st.multiselect(
+    "Variables a mostrar al seleccionar un punto en Google Earth Pro",
+    options=list(resultado.columns),
+    default=[c for c in default_popup_fields if c in resultado.columns],
+    key="popup_fields_google_earth",
+)
+
+kmz_bytes = dataframe_to_kmz_bytes(
+    df=resultado,
+    lat_col=lat_col,
+    lon_col=lon_col,
+    id_col=id_col,
+    popup_fields=popup_fields,
+)
+
+st.download_button(
+    "Descargar planeación en KMZ para Google Earth Pro",
+    data=kmz_bytes,
+    file_name="planeacion_operativa_google_earth.kmz",
+    mime="application/vnd.google-earth.kmz",
+)
+
+st.markdown("---")
 st.markdown(
     """
-    **Mejoras incluidas en esta versión**
-    - Agrupamiento más compacto y balanceado por entrevistador.
-    - Penalización por fragmentación para evitar cargas mal partidas.
-    - Reasignación automática del mapa a solo los entrevistadores seleccionados.
-    - Refinamiento por relocalizaciones y swaps para reducir traslados.
+    **Funcionalidades incluidas en esta versión**
+    - Planeación automática con radicación dura y compactación territorial.
+    - Reasignación manual en mapa por figura.
+    - Asignación de semanas de recorrido sobre la planeación final.
+    - Resumen semanal por entrevistador.
+    - Exportación a Excel.
+    - Exportación a KMZ para Google Earth Pro con colores por entrevistador y popup configurable.
     """
 )
