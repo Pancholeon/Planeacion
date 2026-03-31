@@ -5,3 +5,6 @@ xlrd
 plotly
 scikit-learn
 pydeck
+folium
+streamlit-folium
+numpy
