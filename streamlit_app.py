@@ -2,6 +2,7 @@ import re
 import zipfile
 from io import BytesIO
 from typing import Optional, Tuple
+
 from xml.sax.saxutils import escape
 
 import folium
@@ -9,13 +10,150 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from folium.features import DivIcon
-from folium.plugins import Draw, Fullscreen
+from folium.plugins import Draw, Fullscreen, MiniMap
 from streamlit_folium import st_folium
 
-st.set_page_config(page_title="Planeación operativa - INEGI - 2026", layout="wide")
+# ============================================================
+# CONFIGURACION GENERAL
+# ============================================================
+st.set_page_config(
+    page_title="Planeación operativa - INEGI - 2026",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+    .main > div {
+        padding-top: 1.1rem;
+    }
+    .block-container {
+        padding-top: 1.2rem;
+        padding-bottom: 2rem;
+    }
+    .app-hero {
+        background: linear-gradient(135deg, #0f172a 0%, #1d4ed8 55%, #38bdf8 100%);
+        color: white;
+        border-radius: 18px;
+        padding: 20px 24px;
+        margin-bottom: 1rem;
+        box-shadow: 0 10px 28px rgba(15, 23, 42, 0.18);
+    }
+    .app-hero h1 {
+        margin: 0;
+        font-size: 2rem;
+        font-weight: 800;
+        line-height: 1.1;
+    }
+    .app-hero p {
+        margin: 0.4rem 0 0 0;
+        opacity: 0.92;
+        font-size: 1rem;
+    }
+    .section-card {
+        background: #ffffff;
+        border: 1px solid #e9eef5;
+        border-radius: 16px;
+        padding: 14px 16px;
+        box-shadow: 0 6px 18px rgba(15, 23, 42, 0.04);
+        margin-bottom: 0.9rem;
+    }
+    .mini-note {
+        color: #5b6475;
+        font-size: 0.92rem;
+    }
+    .compact-card {
+        border: 1px solid #e6ebf2;
+        border-radius: 14px;
+        padding: 10px 12px;
+        background: #fff;
+        margin-bottom: 8px;
+    }
+    .compact-title {
+        font-weight: 700;
+        font-size: 0.97rem;
+        color: #172033;
+    }
+    .compact-sub {
+        font-size: 0.80rem;
+        color: #667085;
+        margin-top: 2px;
+    }
+    .badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 0.76rem;
+        font-weight: 700;
+        background: #eef4ff;
+        color: #1d4ed8;
+        margin-right: 6px;
+    }
+    .toolbar-box {
+        border: 1px solid #e8edf5;
+        border-radius: 16px;
+        padding: 14px 16px;
+        background: #f8fbff;
+        margin-top: 10px;
+    }
+    .toolbar-title {
+        font-size: 1rem;
+        font-weight: 800;
+        color: #1e293b;
+        margin-bottom: 2px;
+    }
+    .toolbar-sub {
+        font-size: 0.88rem;
+        color: #64748b;
+        margin-bottom: 10px;
+    }
+    .map-help {
+        background: #eff6ff;
+        border: 1px solid #bfdbfe;
+        border-radius: 12px;
+        padding: 10px 12px;
+        color: #1e3a8a;
+        font-size: 0.9rem;
+        margin-bottom: 10px;
+    }
+    .week-legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 4px;
+        margin-bottom: 6px;
+    }
+    .week-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        border: 1px solid #e5e7eb;
+        border-radius: 999px;
+        padding: 4px 10px;
+        background: white;
+        font-size: 0.82rem;
+        color: #334155;
+    }
+    .week-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 999px;
+        display: inline-block;
+    }
+    div[data-testid="stMetric"] {
+        background: white;
+        border: 1px solid #e8edf5;
+        border-radius: 14px;
+        padding: 8px 10px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ============================================================
-# Catálogos y constantes
+# CATALOGOS Y CONSTANTES
 # ============================================================
 LAT_CANDIDATES = ["latitud", "latitude", "lat", "y"]
 LON_CANDIDATES = ["longitud", "longitude", "lon", "lng", "x"]
@@ -91,16 +229,31 @@ REGION_MUNICIPIO = {
 }
 
 PALETTE = [
-    "#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf",
-    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#393b79", "#637939",
-    "#8c6d31", "#843c39", "#7b4173", "#3182bd", "#31a354", "#756bb1",
+    "#2563eb", "#dc2626", "#16a34a", "#7c3aed", "#ea580c", "#0891b2",
+    "#8b5cf6", "#e11d48", "#0f766e", "#65a30d", "#1d4ed8", "#9333ea",
+    "#be123c", "#7c2d12", "#0f766e", "#0284c7", "#4f46e5", "#0ea5e9",
 ]
+
+WEEK_PALETTE = {
+    1: "#2563eb",
+    2: "#16a34a",
+    3: "#ea580c",
+    4: "#7c3aed",
+    5: "#e11d48",
+    6: "#0891b2",
+    7: "#84cc16",
+    8: "#f59e0b",
+    9: "#06b6d4",
+    10: "#9333ea",
+    11: "#ef4444",
+    12: "#0f766e",
+}
 
 WEEK_COLS = ["SEMANA_RECORRIDO", "SEMANA_NUM", "ORDEN_SEMANA"]
 
 
 # ============================================================
-# Utilidades
+# UTILIDADES GENERALES
 # ============================================================
 @st.cache_data
 def load_excel(file_bytes: bytes, filename: str) -> dict[str, pd.DataFrame]:
@@ -148,9 +301,15 @@ def ordenar_natural(lista):
 
 def color_for_entity(name: str) -> str:
     if pd.isna(name):
-        return "#808080"
+        return "#64748b"
     idx = sum(ord(c) for c in str(name)) % len(PALETTE)
     return PALETTE[idx]
+
+
+def color_for_week(week_num: Optional[int]) -> str:
+    if pd.isna(week_num) or week_num is None:
+        return "#94a3b8"
+    return WEEK_PALETTE.get(int(week_num), PALETTE[int(week_num) % len(PALETTE)])
 
 
 def distancia_km(lat1, lon1, lat2, lon2):
@@ -263,27 +422,6 @@ def soft_targets(n: int, entrevistadores: list[str], min_per: int, max_per: int)
         val = min(val, max_per)
         targets[ent] = max(val, min(min_per, max_per, max(0, int(np.floor(ideal)))))
     return targets
-
-
-def build_knn_indices(coords: np.ndarray, k_neighbors: int = 8) -> np.ndarray:
-    n = len(coords)
-    if n <= 1:
-        return np.zeros((n, 0), dtype=int)
-
-    diffs = coords[:, None, :] - coords[None, :, :]
-    d2 = (diffs ** 2).sum(axis=2)
-    np.fill_diagonal(d2, np.inf)
-    k_use = min(k_neighbors, n - 1)
-    return np.argsort(d2, axis=1)[:, :k_use]
-
-
-def standardize_xy(coords: np.ndarray) -> np.ndarray:
-    if len(coords) == 0:
-        return coords.copy()
-    mu = coords.mean(axis=0)
-    sd = coords.std(axis=0)
-    sd[sd == 0] = 1.0
-    return (coords - mu) / sd
 
 
 def latlon_to_local_xy(lat: np.ndarray, lon: np.ndarray, ref_lat: float, ref_lon: float) -> np.ndarray:
@@ -409,7 +547,7 @@ def quotas_for_group(n_points: int, ent_names_group: list[str], soft_target_map:
 
 
 # ============================================================
-# Planeación semanal y exportación Google Earth
+# SEMANAS DE RECORRIDO
 # ============================================================
 def drop_week_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -447,12 +585,7 @@ def assign_weeks_compact_for_interviewer(
     n_weeks_use = max(1, min(int(n_weeks), n))
     coords = out[[lat_col, lon_col]].to_numpy(dtype=float)
 
-    local_xy = latlon_to_local_xy(
-        coords[:, 0],
-        coords[:, 1],
-        float(base_lat),
-        float(base_lon),
-    )
+    local_xy = latlon_to_local_xy(coords[:, 0], coords[:, 1], float(base_lat), float(base_lon))
     ang = np.mod(np.arctan2(local_xy[:, 1], local_xy[:, 0]), 2 * np.pi)
     rad = np.sqrt((local_xy ** 2).sum(axis=1))
 
@@ -578,7 +711,10 @@ def build_week_summary(df_resultado: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     resumen = (
-        df.groupby(["asignado_a", "SUPERV", "ROE", "MUNICIPIO_RADICACION", "SEMANA_NUM", "SEMANA_RECORRIDO"], dropna=False)
+        df.groupby(
+            ["asignado_a", "SUPERV", "ROE", "MUNICIPIO_RADICACION", "SEMANA_NUM", "SEMANA_RECORRIDO"],
+            dropna=False
+        )
         .size()
         .reset_index(name="registros")
         .rename(columns={"asignado_a": "entrevistador"})
@@ -588,6 +724,9 @@ def build_week_summary(df_resultado: pd.DataFrame) -> pd.DataFrame:
     return resumen
 
 
+# ============================================================
+# EXPORTACION GOOGLE EARTH
+# ============================================================
 def kml_color_from_hex(hex_color: str, alpha: str = "ff") -> str:
     c = (hex_color or "#808080").replace("#", "").strip()
     if len(c) != 6:
@@ -608,9 +747,7 @@ def build_kml_description(row: pd.Series, fields: list[str]) -> str:
     rows = []
     for col in fields:
         if col in row.index:
-            rows.append(
-                f"<tr><td><b>{escape(str(col))}</b></td><td>{safe_html_value(row[col])}</td></tr>"
-            )
+            rows.append(f"<tr><td><b>{escape(str(col))}</b></td><td>{safe_html_value(row[col])}</td></tr>")
 
     html = (
         "<![CDATA["
@@ -714,7 +851,7 @@ def dataframe_to_kmz_bytes(
 
 
 # ============================================================
-# Geometría para mapa
+# GEOMETRIA MAPA
 # ============================================================
 def point_in_polygon(lat: float, lon: float, polygon_latlon: list[tuple[float, float]]) -> bool:
     if len(polygon_latlon) < 3 or pd.isna(lat) or pd.isna(lon):
@@ -768,7 +905,7 @@ def extract_shape_selector(feature: dict):
 
 
 # ============================================================
-# Algoritmo definitivo: radicación dura + compactación
+# ALGORITMO PRINCIPAL DE ASIGNACION
 # ============================================================
 def compact_balanced_assignment(
     df_validos: pd.DataFrame,
@@ -900,10 +1037,7 @@ def compact_balanced_assignment(
     group_loads = np.zeros(gcount, dtype=int)
     point_to_group = np.full(n_asig, -1, dtype=int)
 
-    order_points = np.lexsort((
-        nearest_group_dist,
-        -priorities,
-    ))
+    order_points = np.lexsort((nearest_group_dist, -priorities))
 
     for i in order_points:
         cand_groups = np.where(feasible[i])[0]
@@ -1007,7 +1141,10 @@ def compact_balanced_assignment(
         if len(df_group_unassigned) == 0:
             df_group_unassigned = extra_na.copy()
         else:
-            df_group_unassigned = pd.concat([df_group_unassigned, extra_na.drop(columns=["_orig_idx"], errors="ignore")], ignore_index=True)
+            df_group_unassigned = pd.concat(
+                [df_group_unassigned, extra_na.drop(columns=["_orig_idx"], errors="ignore")],
+                ignore_index=True,
+            )
 
     if "_orig_idx" in df_group_assigned.columns:
         df_group_assigned = df_group_assigned.drop(columns=["_orig_idx"])
@@ -1087,7 +1224,6 @@ def generar_alertas(df: pd.DataFrame) -> pd.DataFrame:
         out["distancia_radicacion_km"] = np.nan
     if "radicacion_viable" not in out.columns:
         out["radicacion_viable"] = False
-
     if "estatus_asignacion" not in out.columns:
         out["estatus_asignacion"] = None
 
@@ -1131,18 +1267,15 @@ def build_summary(df_resultado: pd.DataFrame, plantilla: pd.DataFrame) -> pd.Dat
     df_asig = df_resultado[df_resultado["asignado_a"].notna()].copy()
 
     resumen = (
-        df_asig.groupby(
-            ["asignado_a", "SUPERV", "ROE", "MUNICIPIO_RADICACION"],
-            dropna=False
-        )
+        df_asig.groupby(["asignado_a", "SUPERV", "ROE", "MUNICIPIO_RADICACION"], dropna=False)
         .size()
         .reset_index(name="registros")
         .rename(columns={"asignado_a": "entrevistador"})
     )
 
-    base = plantilla[
-        ["ENTREVISTADOR", "SUPERV", "ROE", "MUNICIPIO_RADICACION"]
-    ].rename(columns={"ENTREVISTADOR": "entrevistador"})
+    base = plantilla[["ENTREVISTADOR", "SUPERV", "ROE", "MUNICIPIO_RADICACION"]].rename(
+        columns={"ENTREVISTADOR": "entrevistador"}
+    )
 
     resumen = base.merge(
         resumen,
@@ -1157,7 +1290,7 @@ def build_summary(df_resultado: pd.DataFrame, plantilla: pd.DataFrame) -> pd.Dat
 
 
 # ============================================================
-# Reasignación interactiva
+# REASIGNACION INTERACTIVA
 # ============================================================
 def apply_geo_reassignment(
     df: pd.DataFrame,
@@ -1188,19 +1321,62 @@ def apply_geo_reassignment(
     return out, int(mask.sum())
 
 
-# ============================================================
-# Mapa
-# ============================================================
-def build_folium_map(
-    df_resultado: pd.DataFrame,
-    plantilla: pd.DataFrame,
+def get_current_drawing(map_state: Optional[dict]) -> Optional[dict]:
+    drawing = None
+    if map_state is not None:
+        drawing = map_state.get("last_active_drawing")
+        if drawing is None:
+            drawings = map_state.get("all_drawings")
+            if drawings and isinstance(drawings, list):
+                drawing = drawings[-1]
+    return drawing
+
+
+def evaluate_selection(
+    df: pd.DataFrame,
     lat_col: str,
     lon_col: str,
-    id_col: Optional[str],
+    drawing: Optional[dict],
+    entrevistadores_visibles: Optional[list[str]] = None,
+) -> tuple[pd.Series, pd.DataFrame]:
+    if drawing is None:
+        mask = pd.Series(False, index=df.index)
+        return mask, pd.DataFrame()
+
+    selector = extract_shape_selector(drawing)
+    if selector is None:
+        mask = pd.Series(False, index=df.index)
+        return mask, pd.DataFrame()
+
+    mask = df.apply(
+        lambda r: bool(selector(r[lat_col], r[lon_col])) if pd.notna(r[lat_col]) and pd.notna(r[lon_col]) else False,
+        axis=1,
+    )
+
+    if entrevistadores_visibles:
+        mask = mask & df["asignado_a"].isin(entrevistadores_visibles)
+
+    sub = df.loc[mask].copy()
+    resumen = (
+        sub.groupby(["asignado_a", "SUPERV", "ROE"], dropna=False)
+        .size()
+        .reset_index(name="registros")
+        .sort_values(["registros", "asignado_a"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    return mask, resumen
+
+
+# ============================================================
+# MAPAS
+# ============================================================
+def get_filtered_frames(
+    df_resultado: pd.DataFrame,
+    plantilla: pd.DataFrame,
     roe_filter: str,
     superv_filter: str,
     entrevistadores_focus: list[str],
-):
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = df_resultado.copy()
     pl = plantilla.copy()
 
@@ -1216,6 +1392,22 @@ def build_folium_map(
         df = df[df["asignado_a"].isin(entrevistadores_focus)]
         pl = pl[pl["ENTREVISTADOR"].isin(entrevistadores_focus)]
 
+    return df, pl
+
+
+def build_folium_map(
+    df_resultado: pd.DataFrame,
+    plantilla: pd.DataFrame,
+    lat_col: str,
+    lon_col: str,
+    id_col: Optional[str],
+    roe_filter: str,
+    superv_filter: str,
+    entrevistadores_focus: list[str],
+    color_mode: str = "entrevistador",
+    enable_draw: bool = True,
+):
+    df, pl = get_filtered_frames(df_resultado, plantilla, roe_filter, superv_filter, entrevistadores_focus)
     df_map = df[df[lat_col].notna() & df[lon_col].notna()].copy()
 
     if len(df_map) == 0:
@@ -1224,24 +1416,26 @@ def build_folium_map(
         centro = (float(df_map[lat_col].mean()), float(df_map[lon_col].mean()))
 
     m = folium.Map(location=centro, zoom_start=8, tiles="CartoDB positron", control_scale=True)
-    Fullscreen().add_to(m)
+    Fullscreen(position="topleft").add_to(m)
+    MiniMap(toggle_display=True).add_to(m)
 
-    draw = Draw(
-        export=False,
-        position="topleft",
-        draw_options={
-            "polyline": False,
-            "marker": False,
-            "circlemarker": False,
-            "polygon": True,
-            "rectangle": True,
-            "circle": True,
-        },
-        edit_options={"edit": False, "remove": True},
-    )
-    draw.add_to(m)
+    if enable_draw:
+        draw = Draw(
+            export=False,
+            position="topleft",
+            draw_options={
+                "polyline": False,
+                "marker": False,
+                "circlemarker": False,
+                "polygon": True,
+                "rectangle": True,
+                "circle": True,
+            },
+            edit_options={"edit": False, "remove": True},
+        )
+        draw.add_to(m)
 
-    fg_bases = folium.FeatureGroup(name="Bases de entrevistadores", show=True)
+    fg_bases = folium.FeatureGroup(name="Bases", show=True)
     for row in pl.itertuples():
         color = color_for_entity(row.ENTREVISTADOR)
         popup = (
@@ -1263,7 +1457,7 @@ def build_folium_map(
             color=color,
             fill=False,
             weight=2,
-            opacity=0.95,
+            opacity=0.9,
         ).add_to(fg_bases)
     fg_bases.add_to(m)
 
@@ -1271,7 +1465,14 @@ def build_folium_map(
     for row in df_map.itertuples():
         ent = getattr(row, "asignado_a", None)
         alerta = getattr(row, "alerta", None)
-        color = color_for_entity(ent if pd.notna(ent) else str(alerta))
+        semana_num = getattr(row, "SEMANA_NUM", np.nan)
+
+        if color_mode == "semana":
+            color = color_for_week(semana_num)
+            tooltip_label = f"{getattr(row, 'SEMANA_RECORRIDO', None)}"
+        else:
+            color = color_for_entity(ent) if pd.notna(ent) else "#94a3b8"
+            tooltip_label = f"{ent if pd.notna(ent) else alerta}"
 
         id_val = getattr(row, id_col) if (id_col is not None and hasattr(row, id_col)) else row.Index
 
@@ -1293,50 +1494,54 @@ def build_folium_map(
             color=color,
             fill=True,
             fill_color=color,
-            fill_opacity=0.95,
+            fill_opacity=0.92,
             opacity=0.95,
-            weight=1.5,
-            tooltip=f"{ent if pd.notna(ent) else alerta}",
+            weight=1.2,
+            tooltip=tooltip_label,
             popup=folium.Popup(popup_html, max_width=320),
         ).add_to(fg_pts)
     fg_pts.add_to(m)
 
-    fg_labels = folium.FeatureGroup(name="Etiquetas de carga", show=True)
-    df_asig = df[df["asignado_a"].notna()].copy()
+    if color_mode == "entrevistador":
+        fg_labels = folium.FeatureGroup(name="Etiquetas de carga", show=True)
+        df_asig = df[df["asignado_a"].notna()].copy()
 
-    cargas = (
-        df_asig.groupby("asignado_a")
-        .agg(registros=(lat_col, "count"), lat=(lat_col, "mean"), lon=(lon_col, "mean"))
-        .reset_index()
-    )
+        cargas = (
+            df_asig.groupby("asignado_a")
+            .agg(registros=(lat_col, "count"), lat=(lat_col, "mean"), lon=(lon_col, "mean"))
+            .reset_index()
+        )
 
-    for r in cargas.itertuples():
-        color = color_for_entity(r.asignado_a)
-        html = f"""
-        <div style="
-            background-color:{color};
-            color:white;
-            border:2px solid white;
-            border-radius:16px;
-            padding:4px 8px;
-            font-size:12px;
-            font-weight:bold;
-            box-shadow:0 0 6px rgba(0,0,0,0.35);
-            white-space:nowrap;">
-            {r.asignado_a}: {int(r.registros)}
-        </div>
-        """
-        folium.Marker(
-            location=[r.lat, r.lon],
-            icon=DivIcon(icon_size=(100, 24), icon_anchor=(0, 0), html=html),
-        ).add_to(fg_labels)
+        for r in cargas.itertuples():
+            color = color_for_entity(r.asignado_a)
+            html = f"""
+            <div style="
+                background-color:{color};
+                color:white;
+                border:2px solid white;
+                border-radius:14px;
+                padding:3px 7px;
+                font-size:11px;
+                font-weight:700;
+                box-shadow:0 0 5px rgba(0,0,0,0.22);
+                white-space:nowrap;">
+                {r.asignado_a}: {int(r.registros)}
+            </div>
+            """
+            folium.Marker(
+                location=[r.lat, r.lon],
+                icon=DivIcon(icon_size=(90, 24), icon_anchor=(0, 0), html=html),
+            ).add_to(fg_labels)
+        fg_labels.add_to(m)
 
-    fg_labels.add_to(m)
     folium.LayerControl(collapsed=False).add_to(m)
     return m
 
 
-def render_side_cards(resumen_panel: pd.DataFrame):
+# ============================================================
+# COMPONENTES UI
+# ============================================================
+def render_compact_load_cards(resumen_panel: pd.DataFrame):
     if resumen_panel.empty:
         st.info("No hay entrevistadores en el filtro actual.")
         return
@@ -1348,32 +1553,16 @@ def render_side_cards(resumen_panel: pd.DataFrame):
         color = row.color
         st.markdown(
             f"""
-            <div style="
-                border:1px solid #e6e6e6;
-                border-left:8px solid {color};
-                border-radius:10px;
-                padding:10px 12px;
-                margin-bottom:10px;
-                background:#ffffff;">
-                <div style="display:flex; justify-content:space-between; align-items:center;">
-                    <div style="font-weight:700; font-size:15px;">{row.entrevistador}</div>
-                    <div style="font-weight:700; font-size:18px;">{int(row.registros)}</div>
-                </div>
-                <div style="font-size:12px; color:#555; margin-top:2px;">
-                    {row.SUPERV} | {row.ROE} | {row.MUNICIPIO_RADICACION}
-                </div>
-                <div style="
-                    margin-top:8px;
-                    width:100%;
-                    background:#f0f2f6;
-                    border-radius:999px;
-                    height:10px;">
-                    <div style="
-                        width:{pct}%;
-                        background:{color};
-                        height:10px;
-                        border-radius:999px;">
+            <div class="compact-card">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+                    <div>
+                        <div class="compact-title">{row.entrevistador}</div>
+                        <div class="compact-sub">{row.SUPERV} · {row.ROE} · {row.MUNICIPIO_RADICACION}</div>
                     </div>
+                    <div style="font-weight:800;font-size:1.05rem;color:#0f172a;">{int(row.registros)}</div>
+                </div>
+                <div style="margin-top:8px;background:#edf2f7;border-radius:999px;height:8px;overflow:hidden;">
+                    <div style="width:{pct}%;background:{color};height:8px;border-radius:999px;"></div>
                 </div>
             </div>
             """,
@@ -1381,19 +1570,129 @@ def render_side_cards(resumen_panel: pd.DataFrame):
         )
 
 
+def render_week_legend(max_weeks: int):
+    if max_weeks <= 0:
+        return
+    parts = []
+    for w in range(1, max_weeks + 1):
+        color = color_for_week(w)
+        parts.append(
+            f"""
+            <span class="week-pill">
+                <span class="week-dot" style="background:{color};"></span>
+                Semana {w}
+            </span>
+            """
+        )
+    st.markdown(f"<div class='week-legend'>{''.join(parts)}</div>", unsafe_allow_html=True)
+
+
+def render_selection_summary(selection_df: pd.DataFrame):
+    if selection_df.empty:
+        st.info("No hay puntos dentro de la figura actual.")
+        return
+
+    st.dataframe(selection_df, use_container_width=True, height=220)
+
+
+def initialize_state():
+    defaults = {
+        "resultado_planeacion": None,
+        "plantilla_planeacion": None,
+        "ultima_planeacion_automatica": None,
+        "selection_preview_count": 0,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def generar_planeacion_completa(
+    df_geo: pd.DataFrame,
+    plantilla_edit: pd.DataFrame,
+    lat_col: str,
+    lon_col: str,
+    priority_col: Optional[str],
+    min_per: int,
+    max_per: int,
+    hard_max_km: float,
+    slack_nearest_km: float,
+    cross_region_max_km: float,
+) -> pd.DataFrame:
+    df_work = df_geo.copy()
+    df_work["row_id"] = np.arange(len(df_work))
+
+    validos = df_work[df_work["coord_valida"]].copy()
+    invalidos = df_work[~df_work["coord_valida"]].copy()
+
+    if len(validos) == 0:
+        raise ValueError("No hay registros válidos con coordenadas.")
+
+    asignados, no_asignados = compact_balanced_assignment(
+        validos,
+        plantilla_edit,
+        lat_col=lat_col,
+        lon_col=lon_col,
+        min_per=int(min_per),
+        max_per=int(max_per),
+        priority_col=priority_col,
+        hard_max_km=float(hard_max_km),
+        slack_nearest_km=float(slack_nearest_km),
+        cross_region_max_km=float(cross_region_max_km),
+    )
+
+    asignados = recalcular_metricas_asignacion(asignados, plantilla_edit, lat_col, lon_col)
+    asignados = generar_alertas(asignados)
+
+    piezas = [asignados]
+
+    if len(no_asignados) > 0:
+        no_asignados = preparar_sin_asignar(no_asignados, "Sin asignar")
+        no_asignados = generar_alertas(no_asignados)
+        piezas.append(no_asignados)
+
+    if len(invalidos) > 0:
+        invalidos = preparar_sin_asignar(invalidos, "Coordenada inválida o a revisar")
+        invalidos = generar_alertas(invalidos)
+        piezas.append(invalidos)
+
+    resultado = pd.concat(piezas, ignore_index=True)
+    resultado = drop_week_columns(resultado)
+    resultado = generar_alertas(resultado)
+    return resultado
+
+
 # ============================================================
-# Interfaz principal
+# INICIO APP
 # ============================================================
-st.title("Planeación operativa de entrevistadores")
-st.caption(
-    "Asignación con radicación dura, compactación territorial, semanas de recorrido y exportación a Google Earth Pro."
+initialize_state()
+
+st.markdown(
+    """
+    <div class="app-hero">
+        <h1>Planeación operativa de entrevistadores</h1>
+        <p>
+            Asignación automática con radicación dura, compactación territorial,
+            reasignación interactiva en mapa, semanas de recorrido y exportación a Excel / KMZ.
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 uploaded = st.file_uploader("Sube tu archivo Excel", type=["xlsx", "xlsm", "xls"])
 
 if uploaded is None:
-    st.info(
-        "La aplicación detecta columnas geográficas, genera una planeación compacta, permite redistribuir puntos en el mapa, asignar semanas y exportar a Google Earth Pro."
+    st.markdown(
+        """
+        <div class="section-card">
+            <div class="mini-note">
+                Esta versión mejora la experiencia del mapa, compacta la vista de cargas y mueve las
+                herramientas de redistribución debajo del mapa para trabajar mejor la reasignación.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
     st.stop()
 
@@ -1404,7 +1703,11 @@ if not sheets:
     st.error("No fue posible leer hojas del archivo.")
     st.stop()
 
-st.sidebar.header("Configuración base")
+# ============================================================
+# SIDEBAR
+# ============================================================
+st.sidebar.header("Configuración")
+
 selected_sheet = st.sidebar.selectbox("Hoja de trabajo", list(sheets.keys()), index=0)
 df_raw = normalize_columns(sheets[selected_sheet])
 
@@ -1456,6 +1759,9 @@ if int(min_per) > int(max_per):
     st.error("El mínimo por entrevistador no puede ser mayor que el máximo.")
     st.stop()
 
+# ============================================================
+# PLANTILLA Y DATOS BASE
+# ============================================================
 with st.expander("Plantilla operativa", expanded=True):
     plantilla_default = construir_plantilla(int(num_interviewers), int(num_supervisores))
     plantilla_edit = st.data_editor(
@@ -1476,85 +1782,71 @@ with st.expander("Plantilla operativa", expanded=True):
 
 df_geo = clean_geo(df_raw, lat_col, lon_col)
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Registros en hoja", len(df_raw))
-c2.metric("Coordenadas válidas", int(df_geo["coord_valida"].sum()))
-c3.metric("Sin coordenadas", int(df_geo[[lat_col, lon_col]].isna().any(axis=1).sum()))
-c4.metric("Entrevistadores", len(plantilla_edit))
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Registros en hoja", len(df_raw))
+m2.metric("Coordenadas válidas", int(df_geo["coord_valida"].sum()))
+m3.metric("Sin coordenadas", int(df_geo[[lat_col, lon_col]].isna().any(axis=1).sum()))
+m4.metric("Entrevistadores", len(plantilla_edit))
 
 with st.expander("Vista previa del archivo", expanded=False):
     st.dataframe(df_raw.head(30), use_container_width=True)
 
-run = st.button("Generar planeación automática", type="primary")
+# ============================================================
+# BOTONES PRINCIPALES
+# ============================================================
+b1, b2 = st.columns([1.2, 2.8])
 
-if run:
-    try:
-        df_work = df_geo.copy()
-        df_work["row_id"] = np.arange(len(df_work))
+with b1:
+    if st.button("Generar planeación automática", type="primary", use_container_width=True):
+        try:
+            resultado_nuevo = generar_planeacion_completa(
+                df_geo=df_geo,
+                plantilla_edit=plantilla_edit,
+                lat_col=lat_col,
+                lon_col=lon_col,
+                priority_col=priority_col,
+                min_per=int(min_per),
+                max_per=int(max_per),
+                hard_max_km=float(hard_max_km),
+                slack_nearest_km=float(slack_nearest_km),
+                cross_region_max_km=float(cross_region_max_km),
+            )
+            st.session_state["resultado_planeacion"] = resultado_nuevo
+            st.session_state["plantilla_planeacion"] = plantilla_edit.copy()
+            st.session_state["ultima_planeacion_automatica"] = resultado_nuevo.copy()
+            st.success("Planeación generada correctamente.")
+            st.rerun()
+        except Exception as e:
+            st.exception(e)
 
-        validos = df_work[df_work["coord_valida"]].copy()
-        invalidos = df_work[~df_work["coord_valida"]].copy()
+with b2:
+    st.markdown(
+        """
+        <div class="section-card">
+            <div class="mini-note">
+                Sugerencia de flujo: primero genera la planeación automática, después revisa el mapa por entrevistador,
+                usa la figura para seleccionar puntos, realiza reasignaciones rápidas y finalmente genera semanas de recorrido.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        if len(validos) == 0:
-            st.error("No hay registros válidos con coordenadas.")
-            st.stop()
-
-        asignados, no_asignados = compact_balanced_assignment(
-            validos,
-            plantilla_edit,
-            lat_col=lat_col,
-            lon_col=lon_col,
-            min_per=int(min_per),
-            max_per=int(max_per),
-            priority_col=priority_col,
-            hard_max_km=float(hard_max_km),
-            slack_nearest_km=float(slack_nearest_km),
-            cross_region_max_km=float(cross_region_max_km),
-        )
-
-        asignados = recalcular_metricas_asignacion(asignados, plantilla_edit, lat_col, lon_col)
-        asignados = generar_alertas(asignados)
-
-        piezas = [asignados]
-
-        if len(no_asignados) > 0:
-            if "estatus_asignacion" not in no_asignados.columns:
-                no_asignados = preparar_sin_asignar(no_asignados, "Sin asignar")
-            else:
-                no_asignados = preparar_sin_asignar(no_asignados, "Sin asignar")
-                # restaurar estatus originales si existían
-            no_asignados = generar_alertas(no_asignados)
-            piezas.append(no_asignados)
-
-        if len(invalidos) > 0:
-            invalidos = preparar_sin_asignar(invalidos, "Coordenada inválida o a revisar")
-            invalidos = generar_alertas(invalidos)
-            piezas.append(invalidos)
-
-        resultado = pd.concat(piezas, ignore_index=True)
-        resultado = drop_week_columns(resultado)
-        resultado = generar_alertas(resultado)
-
-        st.session_state["resultado_planeacion"] = resultado
-        st.session_state["plantilla_planeacion"] = plantilla_edit.copy()
-        st.success("Planeación generada correctamente.")
-        st.rerun()
-
-    except Exception as e:
-        st.exception(e)
-
-if "resultado_planeacion" not in st.session_state or "plantilla_planeacion" not in st.session_state:
+if st.session_state["resultado_planeacion"] is None or st.session_state["plantilla_planeacion"] is None:
     st.stop()
 
 resultado = st.session_state["resultado_planeacion"].copy()
 plantilla_vigente = st.session_state["plantilla_planeacion"].copy()
 
-st.subheader("Mapa principal de planeación")
+# ============================================================
+# FILTROS DE VISTA
+# ============================================================
+st.markdown("## Exploración visual")
 
-flt1, flt2, flt3 = st.columns([1, 1, 1.6])
+flt1, flt2, flt3 = st.columns([1, 1, 1.8])
 
 roe_options = ["Todos"] + ordenar_natural(plantilla_vigente["ROE"].dropna().unique().tolist())
-roe_filter = flt1.selectbox("Filtrar por ROE", roe_options, index=0)
+roe_filter = flt1.selectbox("ROE", roe_options, index=0)
 
 if roe_filter == "Todos":
     sup_base = plantilla_vigente.copy()
@@ -1562,7 +1854,7 @@ else:
     sup_base = plantilla_vigente[plantilla_vigente["ROE"] == roe_filter].copy()
 
 sup_options = ["Todos"] + ordenar_natural(sup_base["SUPERV"].dropna().unique().tolist())
-superv_filter = flt2.selectbox("Filtrar por supervisor", sup_options, index=0)
+superv_filter = flt2.selectbox("Supervisor", sup_options, index=0)
 
 ent_base = plantilla_vigente.copy()
 if roe_filter != "Todos":
@@ -1572,7 +1864,7 @@ if superv_filter != "Todos":
 
 ent_options = ordenar_natural(ent_base["ENTREVISTADOR"].dropna().unique().tolist())
 entrevistadores_focus = flt3.multiselect(
-    "Seleccionar entrevistadores",
+    "Enfocar entrevistadores",
     ent_options,
     default=[],
 )
@@ -1580,30 +1872,76 @@ entrevistadores_focus = flt3.multiselect(
 resumen = build_summary(resultado, plantilla_vigente)
 resumen_semanal = build_week_summary(resultado)
 
-left_map, right_panel = st.columns([3.6, 1.1], gap="large")
+df_filtrado, pl_filtrado = get_filtered_frames(
+    resultado, plantilla_vigente, roe_filter, superv_filter, entrevistadores_focus
+)
+
+left_map, right_panel = st.columns([3.5, 1.2], gap="large")
 
 with left_map:
-    mapa = build_folium_map(
-        resultado,
-        plantilla_vigente,
-        lat_col,
-        lon_col,
-        id_col,
-        roe_filter,
-        superv_filter,
-        entrevistadores_focus,
-    )
+    tab_map1, tab_map2 = st.tabs(["Mapa por entrevistador", "Mapa por semana"])
 
-    map_state = st_folium(
-        mapa,
-        height=760,
-        width=None,
-        key="mapa_planeacion",
-        returned_objects=["last_active_drawing", "all_drawings"],
-    )
+    with tab_map1:
+        st.markdown(
+            """
+            <div class="map-help">
+                Dibuja un polígono, rectángulo o círculo sobre el mapa para analizar una zona y reasignar rápidamente
+                los puntos seleccionados.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        mapa_ents = build_folium_map(
+            resultado,
+            plantilla_vigente,
+            lat_col,
+            lon_col,
+            id_col,
+            roe_filter,
+            superv_filter,
+            entrevistadores_focus,
+            color_mode="entrevistador",
+            enable_draw=True,
+        )
+
+        map_state = st_folium(
+            mapa_ents,
+            height=690,
+            width=None,
+            key="mapa_planeacion_entrevistador",
+            returned_objects=["last_active_drawing", "all_drawings"],
+        )
+
+    with tab_map2:
+        max_weeks_detected = 0
+        if "SEMANA_NUM" in resultado.columns and resultado["SEMANA_NUM"].notna().any():
+            max_weeks_detected = int(pd.to_numeric(resultado["SEMANA_NUM"], errors="coerce").max())
+        render_week_legend(max_weeks_detected)
+
+        mapa_weeks = build_folium_map(
+            resultado,
+            plantilla_vigente,
+            lat_col,
+            lon_col,
+            id_col,
+            roe_filter,
+            superv_filter,
+            entrevistadores_focus,
+            color_mode="semana",
+            enable_draw=False,
+        )
+
+        st_folium(
+            mapa_weeks,
+            height=690,
+            width=None,
+            key="mapa_planeacion_semana",
+            returned_objects=[],
+        )
 
 with right_panel:
-    st.markdown("### Cargas por entrevistador")
+    st.markdown("### Cargas compactas")
 
     resumen_panel = resumen.copy()
     if roe_filter != "Todos":
@@ -1615,102 +1953,124 @@ with right_panel:
 
     total_asignados = int(resultado["asignado_a"].notna().sum())
     total_sin_asignar = int(resultado["asignado_a"].isna().sum())
-    st.metric("Asignados", total_asignados)
-    st.metric("Sin asignar", total_sin_asignar)
+    total_alertas = int((resultado["alerta"] != "OK").sum()) if "alerta" in resultado.columns else 0
 
-    render_side_cards(resumen_panel)
+    cpa, cpb, cpc = st.columns(3)
+    cpa.metric("Asignados", total_asignados)
+    cpb.metric("Sin asignar", total_sin_asignar)
+    cpc.metric("Alertas", total_alertas)
 
-    st.markdown("### Redistribución directa")
-    opciones_target = ent_options if ent_options else ordenar_natural(plantilla_vigente["ENTREVISTADOR"].tolist())
-    target_ent = st.selectbox(
-        "Mover puntos al entrevistador",
-        opciones_target,
-        key="target_ent_mapa",
-    )
+    render_compact_load_cards(resumen_panel)
 
-    limitar_a_foco = st.checkbox(
-        "Reasignar solo puntos de los entrevistadores seleccionados",
-        value=True if entrevistadores_focus else False,
-    )
+# ============================================================
+# BARRA DE HERRAMIENTAS DE SELECCION / REASIGNACION
+# ============================================================
+st.markdown(
+    """
+    <div class="toolbar-box">
+        <div class="toolbar-title">Herramientas de selección y redistribución</div>
+        <div class="toolbar-sub">
+            La lógica ahora trabaja sobre la figura dibujada en el mapa. Primero analiza la selección y luego
+            reasigna con un clic al entrevistador deseado.
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-    st.caption("Dibuja en el mapa un polígono, rectángulo o círculo y aplica la reasignación.")
+selection_drawing = get_current_drawing(map_state)
+limitar_a_foco = st.checkbox(
+    "Limitar la selección a los entrevistadores actualmente enfocados",
+    value=True if entrevistadores_focus else False,
+    key="limitar_reasignacion_foco",
+)
 
-    if st.button("Aplicar reasignación de la figura", type="secondary"):
-        try:
-            drawing = None
-            if map_state is not None:
-                drawing = map_state.get("last_active_drawing")
-                if drawing is None:
-                    drawings = map_state.get("all_drawings")
-                    if drawings and isinstance(drawings, list):
-                        drawing = drawings[-1]
+visibles = entrevistadores_focus if (limitar_a_foco and entrevistadores_focus) else None
+selection_mask, selection_resume = evaluate_selection(
+    df=resultado,
+    lat_col=lat_col,
+    lon_col=lon_col,
+    drawing=selection_drawing,
+    entrevistadores_visibles=visibles,
+)
 
-            if drawing is None:
-                st.warning("No hay figura seleccionada en el mapa.")
-            else:
-                visibles = entrevistadores_focus if (limitar_a_foco and entrevistadores_focus) else None
-                nuevo_resultado, movidos = apply_geo_reassignment(
-                    resultado,
-                    plantilla_vigente,
-                    lat_col,
-                    lon_col,
-                    drawing,
-                    target_ent,
-                    entrevistadores_visibles=visibles,
+sel_count = int(selection_mask.sum())
+st.session_state["selection_preview_count"] = sel_count
+
+sx1, sx2, sx3, sx4 = st.columns(4)
+sx1.metric("Puntos seleccionados", sel_count)
+sx2.metric("Entrevistadores en selección", int(selection_resume["asignado_a"].nunique()) if not selection_resume.empty else 0)
+sx3.metric("Semanas en selección", int(selection_resume.shape[0]) if "SEMANA_RECORRIDO" in resultado.columns and sel_count > 0 else 0)
+sx4.metric("Con alerta", int(resultado.loc[selection_mask, "alerta"].ne("OK").sum()) if sel_count > 0 else 0)
+
+sel_left, sel_right = st.columns([1.5, 2.5], gap="large")
+
+with sel_left:
+    st.markdown("#### Resumen de la selección")
+    render_selection_summary(selection_resume)
+
+with sel_right:
+    st.markdown("#### Reasignación rápida")
+    st.caption("Haz clic en el botón del entrevistador destino para mover los puntos seleccionados.")
+
+    reasignables = ent_options if ent_options else ordenar_natural(plantilla_vigente["ENTREVISTADOR"].tolist())
+    if not reasignables:
+        st.info("No hay entrevistadores disponibles.")
+    else:
+        chunks = [reasignables[i:i + 4] for i in range(0, len(reasignables), 4)]
+        for i, chunk in enumerate(chunks):
+            cols = st.columns(len(chunk))
+            for col, ent in zip(cols, chunk):
+                color = color_for_entity(ent)
+                if col.button(f"Reasignar a {ent}", key=f"btn_reasig_{i}_{ent}", use_container_width=True):
+                    if selection_drawing is None:
+                        st.warning("Primero dibuja una figura en el mapa.")
+                    else:
+                        try:
+                            nuevo_resultado, movidos = apply_geo_reassignment(
+                                resultado,
+                                plantilla_vigente,
+                                lat_col,
+                                lon_col,
+                                selection_drawing,
+                                ent,
+                                entrevistadores_visibles=visibles,
+                            )
+                            nuevo_resultado = drop_week_columns(nuevo_resultado)
+                            st.session_state["resultado_planeacion"] = nuevo_resultado
+                            st.success(f"Reasignación aplicada a {ent}. Registros movidos: {movidos}.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"No se pudo aplicar la reasignación: {e}")
+                col.markdown(
+                    f"""
+                    <div style="height:6px;background:{color};border-radius:999px;margin-top:-2px;margin-bottom:10px;"></div>
+                    """,
+                    unsafe_allow_html=True,
                 )
-                nuevo_resultado = drop_week_columns(nuevo_resultado)
-                st.session_state["resultado_planeacion"] = nuevo_resultado
-                st.success(f"Reasignación aplicada. Registros movidos: {movidos}.")
-                st.rerun()
-        except Exception as e:
-            st.error(f"No se pudo aplicar la reasignación: {e}")
 
-    if st.button("Restablecer a la última planeación automática"):
-        try:
-            df_work = df_geo.copy()
-            df_work["row_id"] = np.arange(len(df_work))
-
-            validos = df_work[df_work["coord_valida"]].copy()
-            invalidos = df_work[~df_work["coord_valida"]].copy()
-
-            asignados, no_asignados = compact_balanced_assignment(
-                validos,
-                plantilla_vigente,
-                lat_col=lat_col,
-                lon_col=lon_col,
-                min_per=int(min_per),
-                max_per=int(max_per),
-                priority_col=priority_col,
-                hard_max_km=float(hard_max_km),
-                slack_nearest_km=float(slack_nearest_km),
-                cross_region_max_km=float(cross_region_max_km),
-            )
-
-            asignados = recalcular_metricas_asignacion(asignados, plantilla_vigente, lat_col, lon_col)
-            asignados = generar_alertas(asignados)
-
-            piezas = [asignados]
-
-            if len(no_asignados) > 0:
-                no_asignados = preparar_sin_asignar(no_asignados, "Sin asignar")
-                no_asignados = generar_alertas(no_asignados)
-                piezas.append(no_asignados)
-
-            if len(invalidos) > 0:
-                invalidos = preparar_sin_asignar(invalidos, "Coordenada inválida o a revisar")
-                invalidos = generar_alertas(invalidos)
-                piezas.append(invalidos)
-
-            resultado_reset = pd.concat(piezas, ignore_index=True)
-            resultado_reset = drop_week_columns(resultado_reset)
-            st.session_state["resultado_planeacion"] = resultado_reset
-            st.success("Planeación restablecida.")
+    ops1, ops2 = st.columns([1, 1])
+    with ops1:
+        if st.button("Eliminar semanas actuales", use_container_width=True):
+            base_no_weeks = drop_week_columns(st.session_state["resultado_planeacion"].copy())
+            st.session_state["resultado_planeacion"] = base_no_weeks
+            st.success("Se eliminaron las semanas actuales.")
             st.rerun()
-        except Exception as e:
-            st.error(f"No se pudo restablecer la planeación: {e}")
 
+    with ops2:
+        if st.button("Restablecer última planeación automática", use_container_width=True):
+            if st.session_state.get("ultima_planeacion_automatica") is not None:
+                st.session_state["resultado_planeacion"] = st.session_state["ultima_planeacion_automatica"].copy()
+                st.success("Planeación restablecida.")
+                st.rerun()
+            else:
+                st.warning("Aún no existe una planeación automática guardada.")
+
+# ============================================================
+# SEMANAS DE RECORRIDO
+# ============================================================
 st.markdown("---")
-st.subheader("Asignación de semanas de recorrido")
+st.markdown("## Asignación de semanas de recorrido")
 
 wk1, wk2, wk3 = st.columns([1, 1, 1.4])
 
@@ -1723,12 +2083,12 @@ num_weeks = wk1.number_input(
 )
 
 solo_asignados_actuales = wk2.checkbox(
-    "Usar planeación final actual",
+    "Usar la planeación actual",
     value=True,
     key="solo_asignados_actuales",
 )
 
-if wk3.button("Generar semanas de recorrido", type="primary"):
+if wk3.button("Generar semanas compactas", type="primary", use_container_width=True):
     try:
         base_df = st.session_state["resultado_planeacion"].copy() if solo_asignados_actuales else resultado.copy()
         base_df = drop_week_columns(base_df)
@@ -1751,6 +2111,9 @@ resultado = st.session_state["resultado_planeacion"].copy()
 resumen = build_summary(resultado, plantilla_vigente)
 resumen_semanal = build_week_summary(resultado)
 
+# ============================================================
+# KPIS
+# ============================================================
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Asignados", int(resultado["asignado_a"].notna().sum()))
 k2.metric("Sin asignar", int(resultado["asignado_a"].isna().sum()))
@@ -1766,6 +2129,9 @@ k4.metric(
     if "alerta" in resultado.columns else 0
 )
 
+# ============================================================
+# TABS DE RESULTADOS
+# ============================================================
 tab1, tab2, tab3, tab4 = st.tabs(["Resumen operativo", "Resumen semanal", "Alertas", "Detalle de registros"])
 
 with tab1:
@@ -1784,6 +2150,9 @@ with tab3:
 with tab4:
     st.dataframe(resultado, use_container_width=True, height=520)
 
+# ============================================================
+# EXPORTACION EXCEL
+# ============================================================
 export_bytes = dataframe_to_excel_bytes(
     {
         "asignacion": resultado,
@@ -1832,6 +2201,9 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
+# ============================================================
+# EXPORTACION KMZ
+# ============================================================
 st.markdown("---")
 st.subheader("Descarga para Google Earth Pro")
 
@@ -1879,12 +2251,14 @@ st.download_button(
 st.markdown("---")
 st.markdown(
     """
-    **Funcionalidades incluidas en esta versión**
+    **Esta versión incluye**
     - Planeación automática con radicación dura y compactación territorial.
-    - Reasignación manual en mapa por figura.
-    - Asignación de semanas de recorrido sobre la planeación final.
-    - Resumen semanal por entrevistador.
+    - Reasignación manual basada en figura dibujada en mapa.
+    - Barra de acciones debajo del mapa para reasignar más rápido.
+    - Vista compacta de cargas por entrevistador.
+    - Asignación de semanas reutilizando el algoritmo de compactación.
+    - Mapa por entrevistador y mapa por semana.
     - Exportación a Excel.
-    - Exportación a KMZ para Google Earth Pro con colores por entrevistador y popup configurable.
+    - Exportación a KMZ para Google Earth Pro.
     """
 )
